@@ -2,10 +2,10 @@
   <img src="https://tilemaps.com/static/img/logo-dark-theme-2x.png" alt="Tilemaps.com" height="64">
 </p>
 
-<h1 align="center">Tilemaps Store for Defold</h1>
+<h1 align="center"><strong>Tilemaps Store</strong> for <strong>Defold</strong></h1>
 
 <p align="center">
-  Drop ready-made tilemaps into your Defold game — browse the <a href="https://tilemaps.com">Tilemaps.com</a> marketplace, grab what you need, and import it without leaving the editor.
+  Import <a href="https://tilemaps.com">Tilemaps.com</a> projects into <a href="https://defold.com">Defold</a>.
 </p>
 
 <p align="center">
