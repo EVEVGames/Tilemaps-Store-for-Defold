@@ -1,0 +1,1432 @@
+-- ============================================================================
+-- Tilemaps Store — Defold editor script.
+-- (c) 2026 Tilemaps.com — All rights reserved.
+-- ============================================================================
+
+local M = {}
+
+-- ----------------------------------------------------------------------------
+-- Configuration
+-- ----------------------------------------------------------------------------
+local BASE_URL     = "https://tilemaps.com"
+local API_URL      = BASE_URL .. "/api/v1/"
+local DOWNLOAD_FMT = "defold"
+local PER_PAGE     = 12
+local LOGO_URL     = BASE_URL .. "/static/img/logo-dark-theme-2x.png"
+local TMP_ZIP_NAME = "tilemaps_store_download.zip"   -- written under /.internal
+
+local PATH_SEP   = package.config:sub(1, 1)
+local IS_WINDOWS = PATH_SEP ~= "/"
+
+-- Files we never rewrite/scan as text during path adaptation.
+local BINARY_EXT = {
+	png = true, jpg = true, jpeg = true, gif = true, bmp = true, tga = true,
+	psd = true, wav = true, ogg = true, opus = true, mp3 = true, ttf = true,
+	otf = true, zip = true, glb = true, gltf = true, bin = true, jar = true,
+}
+
+local PREF_TOKEN     = "tilemaps_store.api_token"
+local PREF_OVERWRITE = "tilemaps_store.overwrite_slugs"       -- slugs with "Overwrite" checked
+local PREF_NO_ASSETS = "tilemaps_store.exclude_assets_slugs"  -- slugs with "Include assets" unchecked
+local PREF_FOLDERS   = "tilemaps_store.folders"               -- slug -> chosen destination folder
+local PREF_TITLES    = "tilemaps_store.downloaded_titles"     -- slug -> title (for the Downloaded tab)
+
+-- Stable refs reused across re-renders (a fresh literal each render would reset state / re-run memos).
+local EMPTY_LIST = {}
+local NOT_LOADED = {}   -- sentinel: list not fetched yet (distinct from [])
+local function new_map() return {} end
+
+-- ----------------------------------------------------------------------------
+-- Small helpers
+-- ----------------------------------------------------------------------------
+
+---Percent-encode a string for use in a URL query value or path segment.
+---@param str any
+---@return string
+local function url_encode(str)
+	return (tostring(str):gsub("[^%w%-_%.~]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+---Build a query string from a table, skipping nil/empty values.
+---@param params table
+---@return string
+local function build_query(params)
+	local parts = {}
+	for key, value in pairs(params) do
+		if value ~= nil and value ~= "" then
+			parts[#parts + 1] = url_encode(key) .. "=" .. url_encode(value)
+		end
+	end
+	return table.concat(parts, "&")
+end
+
+---Turn a possibly-relative thumbnail URL into an absolute one.
+---@param url string
+---@return string
+local function absolute_url(url)
+	if url:match("^https?://") then
+		return url
+	elseif url:sub(1, 1) == "/" then
+		return BASE_URL .. url
+	end
+	return BASE_URL .. "/" .. url
+end
+
+---Return the first non-empty thumbnail URL from a project's thumbnails array.
+---@param thumbnails any
+---@return string|nil
+local function first_thumb(thumbnails)
+	if type(thumbnails) ~= "table" then
+		return nil
+	end
+	for _, url in ipairs(thumbnails) do
+		if type(url) == "string" and url ~= "" then
+			return absolute_url(url)
+		end
+	end
+	return nil
+end
+
+---Perform an authenticated GET against /api/v1/<method>, decoding JSON.
+---@param method string API method name
+---@param token string API key, sent as an Authorization: Bearer header
+---@param params table|nil extra query parameters
+---@return table|nil body decoded JSON body, or nil on error
+---@return string|nil err "unauthorized" or a human-readable message on error
+local function api_get(method, token, params)
+	local url = API_URL .. method
+	local query = build_query(params or {})
+	if query ~= "" then
+		url = url .. "?" .. query
+	end
+
+	local ok, response = pcall(http.request, url, {
+		as = "json",
+		headers = { Authorization = "Bearer " .. token },
+	})
+	if not ok then
+		return nil, "network error: " .. tostring(response)
+	end
+	if response.status == 401 then
+		return nil, "unauthorized"
+	end
+	if response.status ~= 200 then
+		local msg = (type(response.body) == "table" and response.body.error)
+			or ("HTTP " .. tostring(response.status))
+		return nil, msg
+	end
+	return response.body, nil
+end
+
+---Map a download HTTP status to a friendly message.
+---@param status integer
+---@return string
+local function download_status_message(status)
+	if status == 0 then return "network error — no response from server" end
+	if status == 401 then return "unauthorized — check your API token" end
+	if status == 402 then return "payment required — this is a paid project you don't own" end
+	if status == 403 then return "forbidden — no access to this project or build" end
+	if status == 404 then return "not found — no Defold export for this release" end
+	return "HTTP " .. tostring(status)
+end
+
+---Fetch the server's error text for a failed download (the streaming download discards the body).
+---@param url string
+---@param headers table request headers (the Bearer auth)
+---@param status integer the error status already seen
+---@return string
+local function download_error_message(url, headers, status)
+	local ok, resp = pcall(http.request, url, { as = "json", headers = headers })
+	if ok and type(resp.body) == "table" and type(resp.body.error) == "string" then
+		return resp.body.error .. " (HTTP " .. status .. ")"
+	end
+	return download_status_message(status)
+end
+
+---Stream `url` to absolute path `dest` with Bearer auth; returns HTTP status, or nil+err on network failure.
+---http.request `path` writes bytes verbatim over IPv4; on an error status no file is written (path & as are exclusive).
+---@param url string
+---@param dest string absolute destination path
+---@param token string API key, sent as an Authorization: Bearer header
+---@return integer|nil status
+---@return string|nil err
+local function download_file(url, dest, token)
+	local ok, resp = pcall(http.request, url, {
+		path = dest,
+		headers = { Authorization = "Bearer " .. token },
+	})
+	if not ok then
+		return nil, "network error: " .. tostring(resp)
+	end
+	return resp.status
+end
+
+-- ----------------------------------------------------------------------------
+-- Resource path adaptation
+-- ----------------------------------------------------------------------------
+-- Exports use root-absolute resource paths; under /<folder>/ they break, so we rewrite quoted refs
+-- that match an extracted file to their new path. Unmatched refs (/builtins, URLs) and game.project.sample are left as-is.
+
+---Normalize OS path separators to "/".
+local function to_slash(s)
+	return (s:gsub(PATH_SEP, "/"))
+end
+
+---basename (segment after the last separator).
+local function basename(p)
+	return to_slash(p):match("[^/]+$")
+end
+
+---lowercase file extension without the dot.
+local function file_ext(name)
+	return (name:match("%.([%w]+)$") or ""):lower()
+end
+
+---Resource path of `abs` relative to a base of normalized length `base_len`.
+local function res_path(abs, base_len)
+	local rel = to_slash(abs):sub(base_len + 1)
+	if rel:sub(1, 1) ~= "/" then rel = "/" .. rel end
+	return rel
+end
+
+---Recursively list files (not directories) under an absolute directory.
+local function list_files_recursive(dir_abs)
+	local out
+	if IS_WINDOWS then
+		out = editor.execute("cmd", "/c", "dir", "/b", "/s", "/a-d", dir_abs,
+			{ out = "capture", err = "discard", reload_resources = false })
+	else
+		out = editor.execute("find", dir_abs, "-type", "f",
+			{ out = "capture", err = "discard", reload_resources = false })
+	end
+	local files = {}
+	if out then
+		for line in tostring(out):gmatch("[^\r\n]+") do
+			files[#files + 1] = line
+		end
+	end
+	return files
+end
+
+---Rewrite absolute resource references inside the extracted project to their new /<folder>/... location.
+---@param extract_dir string
+---@param user_root string the Defold project root (absolute)
+local function adapt_resource_paths(extract_dir, user_root)
+	local files = list_files_recursive(extract_dir)
+	if #files == 0 then return end
+
+	-- The export's root is the dir holding game.project(.sample); resource paths are absolute from there.
+	local proj_root = extract_dir
+	for _, f in ipairs(files) do
+		local name = basename(f)
+		if name == "game.project.sample" or name == "game.project" then
+			proj_root = f:sub(1, #f - #name - 1)  -- strip separator + name
+			break
+		end
+	end
+
+	local user_len = #to_slash(user_root)
+	local proj_norm = to_slash(proj_root)
+	local proj_len = #proj_norm
+
+	-- old (export-root-relative) path -> new (project-root-relative) path.
+	local map = {}
+	for _, f in ipairs(files) do
+		if to_slash(f):sub(1, proj_len) == proj_norm then
+			map[res_path(f, proj_len)] = res_path(f, user_len)
+		end
+	end
+
+	local function rewrite(content)
+		return (content:gsub("([\"'])(/[^\"'%c]*)([\"'])", function(q1, p, q2)
+			local mapped = map[p]
+			if mapped then return q1 .. mapped .. q2 end
+			return q1 .. p .. q2
+		end))
+	end
+
+	for _, f in ipairs(files) do
+		if to_slash(f):sub(1, proj_len) == proj_norm then
+			local name = basename(f)
+			if name ~= "game.project.sample" and not BINARY_EXT[file_ext(name)] then
+				local fh = io.open(f, "rb")
+				if fh then
+					local content = fh:read("*a") or ""
+					fh:close()
+					if not content:find("\0", 1, true) then  -- skip binaries missed by the extension check
+						local new_content = rewrite(content)
+						if new_content ~= content then
+							local w = io.open(f, "wb")
+							if w then
+								w:write(new_content)
+								w:close()
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+---Download a project ZIP and extract its whole contents into /<folder>/ (created if missing), then adapt paths.
+---@param url string
+---@param folder string destination folder name (project.folder)
+---@param opts table { token = string, overwrite = boolean, include_assets = boolean }
+---@return boolean success
+---@return string|nil err
+local function download_and_extract(url, folder, opts)
+	-- Resolve absolute paths via the editor (subprocess CWD is not the project root).
+	local internal = editor.external_file_attributes(".internal")
+	local root = editor.external_file_attributes(".")
+	if not (internal and internal.path and root and root.path) then
+		return false, "cannot resolve project paths"
+	end
+	local sep = package.config:sub(1, 1)
+	local tmp = internal.path .. sep .. TMP_ZIP_NAME
+	local target = root.path .. sep .. folder
+
+	local status, err = download_file(url, tmp, opts.token)
+	if not status then
+		return false, err
+	end
+	if status ~= 200 then
+		return false, download_error_message(url, { Authorization = "Bearer " .. opts.token }, status)
+	end
+
+	-- zip.unpack creates the target dir; OVERWRITE replaces conflicts, SKIP keeps existing files.
+	local unpack_ok, result, unpack_err = pcall(zip.unpack, tmp, target, {
+		on_conflict = opts.overwrite and zip.ON_CONFLICT.OVERWRITE or zip.ON_CONFLICT.SKIP,
+	})
+	os.remove(tmp)
+
+	if not unpack_ok then
+		return false, "failed to unpack archive: " .. tostring(result)
+	end
+	if result == false then
+		return false, "failed to unpack archive: " .. tostring(unpack_err)
+	end
+
+	-- Drop assets before path adaptation, so no reference is rewritten into a deleted dir.
+	if not opts.include_assets then
+		pcall(editor.delete_directory, "/" .. folder .. "/assets")
+	end
+
+	pcall(adapt_resource_paths, target, root.path)
+	return true, nil
+end
+
+-- ----------------------------------------------------------------------------
+-- Release / version helpers
+-- ----------------------------------------------------------------------------
+
+---Newest published release id (last non-"dev" entry, oldest→newest ordering).
+---@param releases table
+---@return string|nil
+local function newest_release_id(releases)
+	for i = #releases, 1, -1 do
+		if releases[i] ~= "dev" then
+			return releases[i]
+		end
+	end
+	return nil
+end
+
+---Default release id for a card: the live "dev" build when offered, else the newest published, else "latest".
+---@param project table
+---@return string
+local function default_release(project)
+	local releases = project.releases_id or EMPTY_LIST
+	for _, id in ipairs(releases) do
+		if id == "dev" then
+			return "dev"
+		end
+	end
+	return newest_release_id(releases) or "latest"
+end
+
+---Human-friendly label for a release id in the version dropdown.
+---@param id string
+---@param newest string|nil newest published id (gets a "(latest)" marker)
+---@return string
+local function release_label(id, newest)
+	if id == "dev" then
+		return "Development build"
+	elseif id == "latest" then
+		return "Latest release"
+	elseif newest and id == newest then
+		return "Release #" .. id .. " (latest)"
+	end
+	return "Release #" .. id
+end
+
+---Return a copy of `map` with `key` set to `value` (immutable state update).
+---@param map table
+---@param key any
+---@param value any
+---@return table
+local function with_key(map, key, value)
+	local copy = {}
+	for k, v in pairs(map) do
+		copy[k] = v
+	end
+	copy[key] = value
+	return copy
+end
+
+---Return a copy of `map` without `key` (immutable removal).
+---@param map table
+---@param key any
+---@return table
+local function without_key(map, key)
+	local copy = {}
+	for k, v in pairs(map) do
+		if k ~= key then
+			copy[k] = v
+		end
+	end
+	return copy
+end
+
+---Client-side title filter for the non-marketplace tabs (the API has no `q` for those).
+---@param list table
+---@param query string
+---@return table
+local function filter_by_title(list, query)
+	if not query or query == "" then
+		return list
+	end
+	local lower = string.lower(query)
+	local out = {}
+	for _, project in ipairs(list) do
+		local title = string.lower(project.title or project.name or "")
+		if string.find(title, lower, 1, true) then
+			out[#out + 1] = project
+		end
+	end
+	return out
+end
+
+---Normalize a get_public_projects response into the dialog's marketplace state.
+---@param body table|nil
+---@return table
+local function make_marketplace(body)
+	return {
+		items = (body and body.projects) or {},
+		page = (body and body.page) or 1,
+		total_pages = (body and body.total_pages) or 1,
+	}
+end
+
+-- ----------------------------------------------------------------------------
+-- Preferences: per-project slug sets remembering the download options modal
+-- ----------------------------------------------------------------------------
+
+---Is this slug flagged in the given slug-set preference?
+---@param pref string preference key (a schema.set of slugs)
+---@param slug string
+---@return boolean
+local function slug_flag(pref, slug)
+	local set = editor.prefs.get(pref) or EMPTY_LIST
+	return set[slug] == true
+end
+
+---Flag/unflag a slug in the given slug-set preference (project scope).
+---@param pref string preference key (a schema.set of slugs)
+---@param slug string
+---@param flagged boolean
+local function set_slug_flag(pref, slug, flagged)
+	local set = editor.prefs.get(pref) or EMPTY_LIST
+	local copy = {}
+	for k, v in pairs(set) do
+		copy[k] = v
+	end
+	copy[slug] = flagged or nil   -- sets store `true` values; absent means false
+	editor.prefs.set(pref, copy)
+end
+
+-- ----------------------------------------------------------------------------
+-- Destination folder helpers
+-- ----------------------------------------------------------------------------
+
+---State of "/<folder>" in the project (pcall guards free-typed input the resource system rejects).
+---@param folder string project-relative folder path, no leading slash
+---@return boolean exists
+---@return boolean is_file it exists but is a file, not a directory
+local function folder_state(folder)
+	if folder == "" then
+		return false, false
+	end
+	local ok, attrs = pcall(editor.resource_attributes, "/" .. folder)
+	if not ok or type(attrs) ~= "table" then
+		return false, false
+	end
+	return attrs.exists == true, attrs.is_file == true
+end
+
+---Validation message for a destination folder path, or nil when usable (is_file comes from folder_state).
+---@param folder string project-relative folder path, no leading slash
+---@param is_file boolean whether /<folder> currently exists as a file
+---@return string|nil
+local function folder_issue_message(folder, is_file)
+	if folder == "" then
+		return "Folder name is required"
+	end
+	if folder:match("^/") or folder:match("/$") or folder:find("//", 1, true) then
+		return 'Use a project-relative path like "my-pack" or "packs/my-pack"'
+	end
+	for segment in folder:gmatch("[^/]+") do
+		if not segment:match("^[%w_%-][%w_%-%.]*$") then
+			return "Only letters, digits, '_', '-' and '.' are supported (no leading dot)"
+		end
+	end
+	local first = folder:match("^[^/]+")
+	if first == "builtins" or first == "build" then
+		return '"/' .. first .. '" is reserved by Defold'
+	end
+	if is_file then
+		return '"/' .. folder .. '" is an existing file, not a folder'
+	end
+	return nil
+end
+
+-- ----------------------------------------------------------------------------
+-- Token modal
+-- ----------------------------------------------------------------------------
+
+-- string_field only reports on commit (Enter / focus loss), not per keystroke; we clear the error on edit.
+local token_dialog = editor.ui.component(function(props)
+	local token, set_token = editor.ui.use_state(props.prefill or "")
+	local error_msg, set_error = editor.ui.use_state(props.message)
+
+	-- Surface a bad token through the field's `issue` (invalid = ERROR, couldn't-verify = WARNING).
+	local issue
+	if error_msg and error_msg ~= "" then
+		issue = {
+			severity = props.severity or editor.ui.ISSUE_SEVERITY.ERROR,
+			message = error_msg,
+		}
+	end
+
+	local children = {}
+	children[#children + 1] = editor.ui.label({
+		text = "Paste your API token (Tilemaps.com account settings) and press Enter:",
+		color = editor.ui.COLOR.TEXT,
+	})
+	children[#children + 1] = editor.ui.string_field({
+		value = token,
+		issue = issue,
+		on_value_changed = function(text)
+			set_token(text)
+			set_error(nil)
+		end,
+	})
+	children[#children + 1] = editor.ui.button({
+		text = "Open account settings",
+		on_pressed = function()
+			editor.browse(BASE_URL .. "/settings/account")
+		end,
+	})
+
+	return editor.ui.dialog({
+		title = "Tilemaps.com — API Token",
+		header = editor.ui.horizontal({
+			spacing = editor.ui.SPACING.MEDIUM,
+			alignment = editor.ui.ALIGNMENT.CENTER,
+			children = {
+				editor.ui.image({ image = LOGO_URL, height = 24 }),
+				editor.ui.heading({ text = "API Token", style = editor.ui.HEADING_STYLE.DIALOG }),
+			},
+		}),
+		content = editor.ui.vertical({
+			padding = editor.ui.PADDING.LARGE,
+			spacing = editor.ui.SPACING.MEDIUM,
+			children = children,
+		}),
+		buttons = {
+			editor.ui.dialog_button({ text = "Cancel", cancel = true }),
+			editor.ui.dialog_button({
+				text = "Save",
+				default = true,
+				enabled = token ~= "",
+				result = token,
+			}),
+		},
+	})
+end)
+
+---Verify a token cheaply against an authenticated endpoint.
+---@param token string
+---@return string|nil err nil when valid, "unauthorized" or a message otherwise
+local function validate_token(token)
+	local _, err = api_get("get_public_projects", token, { page = 1, per_page = 1 })
+	return err
+end
+
+---Prompt for a token, validating each attempt, until valid or cancelled (nil = cancelled).
+---@param message string|nil initial message shown above the field
+---@return string|nil token
+local function prompt_for_token(message)
+	local prefill = editor.prefs.get(PREF_TOKEN) or ""
+	local severity = editor.ui.ISSUE_SEVERITY.ERROR
+	while true do
+		local entered = editor.ui.show_dialog(token_dialog({
+			message = message,
+			severity = severity,
+			prefill = prefill,
+		}))
+		if not entered then
+			return nil
+		end
+		prefill = entered
+		local err = validate_token(entered)
+		if not err then
+			editor.prefs.set(PREF_TOKEN, entered)
+			return entered
+		elseif err == "unauthorized" then
+			message = "Invalid token. Check your account settings and try again."
+			severity = editor.ui.ISSUE_SEVERITY.ERROR
+		else
+			message = "Could not verify token (" .. err .. "). Try again."
+			severity = editor.ui.ISSUE_SEVERITY.WARNING
+		end
+	end
+end
+
+-- ----------------------------------------------------------------------------
+-- Download options modal
+-- ----------------------------------------------------------------------------
+-- Editable destination folder (resource_field, validated via `issue`) + include-assets / overwrite choices,
+-- all remembered per slug. The typed path only commits on Enter/blur, so existence checks run in on_value_changed.
+
+local download_options_dialog = editor.ui.component(function(props)
+	local folder, set_folder = editor.ui.use_state(props.folder)
+	local exists, set_exists = editor.ui.use_state(props.folder_exists)
+	local is_file, set_is_file = editor.ui.use_state(props.folder_is_file)
+	local include_assets, set_include_assets = editor.ui.use_state(props.include_assets)
+	local overwrite, set_overwrite = editor.ui.use_state(props.overwrite)
+
+	local issue_msg = folder_issue_message(folder, is_file)
+	local issue
+	if issue_msg then
+		issue = { severity = editor.ui.ISSUE_SEVERITY.ERROR, message = issue_msg }
+	end
+
+	local children = {
+		editor.ui.paragraph({
+			text = "Folder (relative to the project root) that will receive the download:",
+			color = editor.ui.COLOR.TEXT,
+		}),
+		editor.ui.resource_field({
+			value = "/" .. folder,
+			issue = issue,
+			title = "Select destination folder",
+			on_value_changed = function(value)
+				local path = (value or ""):gsub("^/+", "")
+				local now_exists, now_is_file = folder_state(path)
+				-- The selector only lists files; picking one means "use its containing folder".
+				if now_is_file then
+					local parent = path:match("^(.*)/[^/]+$")
+					if parent and parent ~= "" then
+						path = parent
+						now_exists, now_is_file = folder_state(path)
+					end
+				end
+				set_folder(path)
+				set_exists(now_exists)
+				set_is_file(now_is_file)
+			end,
+		}),
+		-- Static label: check_box text is single-line, so a folder path here would stretch the dialog.
+		editor.ui.check_box({
+			value = include_assets,
+			on_value_changed = set_include_assets,
+			text = "Include project assets",
+			tooltip = 'When unchecked, the export\'s "assets" subfolder (source art) '
+				.. "is removed right after extraction.",
+		}),
+	}
+	-- Always shown; only usable once the chosen folder exists (a first download has nothing to overwrite).
+	children[#children + 1] = editor.ui.check_box({
+		value = overwrite,
+		on_value_changed = set_overwrite,
+		enabled = exists and not issue_msg,
+		text = "Overwrite existing files",
+		tooltip = "When unchecked, files already in the folder are kept and "
+			.. "only new files are added.",
+	})
+
+	-- Existing folder => this is an update; word the title/confirm button to match the card button.
+	local action = exists and "Update" or "Download"
+
+	return editor.ui.dialog({
+		title = action .. " project",
+		content = editor.ui.vertical({
+			padding = editor.ui.PADDING.LARGE,
+			spacing = editor.ui.SPACING.MEDIUM,
+			children = children,
+		}),
+		buttons = {
+			editor.ui.dialog_button({ text = "Cancel", cancel = true }),
+			editor.ui.dialog_button({
+				text = action,
+				default = true,
+				enabled = issue_msg == nil,
+				result = { folder = folder, include_assets = include_assets, overwrite = overwrite },
+			}),
+		},
+	})
+end)
+
+-- ----------------------------------------------------------------------------
+-- Download action (runs from a card's Download button)
+-- ----------------------------------------------------------------------------
+
+---@param project table project record from the API
+---@param ctx table { token, selection, set_status }
+local function download_project(project, ctx)
+	local slug = project.slug
+	local release_id = ctx.selection[slug] or default_release(project)
+	local title = project.title or project.name or slug
+
+	-- Options gate, prefilled from the remembered per-slug choices (folder falls back to the project default).
+	local saved_folders = editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST
+	local initial_folder = saved_folders[slug] or project.folder or slug
+	local initial_exists, initial_is_file = folder_state(initial_folder)
+	local opts = editor.ui.show_dialog(download_options_dialog({
+		folder = initial_folder,
+		folder_exists = initial_exists,
+		folder_is_file = initial_is_file,
+		include_assets = not slug_flag(PREF_NO_ASSETS, slug),
+		overwrite = slug_flag(PREF_OVERWRITE, slug),
+	}))
+	if not opts then
+		ctx.set_status("Download cancelled.")
+		return
+	end
+
+	-- Re-validate the chosen folder outside the dialog (belt and braces).
+	local folder = opts.folder
+	local folder_exists, folder_is_file = folder_state(folder)
+	local bad = folder_issue_message(folder, folder_is_file)
+	if bad then
+		ctx.set_status("Download cancelled: " .. bad)
+		return
+	end
+
+	-- Remember the choices for next time (overwrite only when the folder existed and the box was shown).
+	editor.prefs.set(PREF_FOLDERS, with_key(saved_folders, slug, folder))
+	set_slug_flag(PREF_NO_ASSETS, slug, not opts.include_assets)
+	if folder_exists then
+		set_slug_flag(PREF_OVERWRITE, slug, opts.overwrite)
+	end
+
+	local url = BASE_URL .. "/project/" .. url_encode(slug) .. "/download/" .. DOWNLOAD_FMT
+		.. "?release_id=" .. url_encode(release_id)
+
+	-- Existing folder => "update"; fresh folder => "download". Match the card button wording.
+	local verb_ing = folder_exists and "Updating" or "Downloading"
+	local verb_done = folder_exists and "Updated" or "Downloaded"
+	local verb_fail = folder_exists and "Update" or "Download"
+
+	ctx.set_status(verb_ing .. " '" .. title .. "'…")
+	print("[Tilemaps Store] " .. verb_ing .. " '" .. title .. "' (release " .. release_id .. ")…")
+	local ok, err = download_and_extract(url, folder, {
+		token = ctx.token,
+		overwrite = opts.overwrite or not folder_exists,  -- nothing to keep in a fresh folder
+		include_assets = opts.include_assets,
+	})
+	if ok then
+		-- Status BEFORE editor.save/prefs.set: those consume the render cycle, so a later set_status
+		-- wouldn't repaint until the next UI event (bar stuck on "Downloading…").
+		ctx.set_status(verb_done .. " '" .. title .. "' to /" .. folder)
+		print("[Tilemaps Store] " .. verb_done .. " '" .. title .. "' to /" .. folder)
+		editor.prefs.set(PREF_TITLES, with_key(editor.prefs.get(PREF_TITLES) or EMPTY_LIST, slug, title))
+		pcall(editor.save)
+	else
+		ctx.set_status(verb_fail .. " failed: " .. tostring(err))
+		print("[Tilemaps Store] " .. verb_fail .. " failed: " .. tostring(err))
+	end
+end
+
+-- ----------------------------------------------------------------------------
+-- Card (plain builder — no hooks, so a function is enough)
+-- ----------------------------------------------------------------------------
+
+---Pluralized tally fragment; nil when the count is unknown, or 0 with hide_zero (used for assets).
+---@param count any numeric *_count field from the API
+---@param list any array-of-records alternative from the API
+---@param singular string
+---@param hide_zero boolean|nil omit the fragment when the count is 0
+---@return string|nil
+local function tally_label(count, list, singular, hide_zero)
+	local n = count
+	if type(n) ~= "number" then
+		n = type(list) == "table" and #list or nil
+	end
+	if type(n) ~= "number" then
+		return nil
+	end
+	if hide_zero and n == 0 then
+		return nil
+	end
+	return n .. " " .. singular .. (n == 1 and "" or "s")
+end
+
+---Filled/empty star string for a rating, or nil when there are no reviews.
+local function rating_stars(avg, count)
+	if not count or count <= 0 or not avg or avg <= 0 then
+		return nil
+	end
+	local filled = math.floor(avg + 0.5)
+	if filled < 0 then filled = 0 elseif filled > 5 then filled = 5 end
+	return string.rep("★", filled) .. string.rep("☆", 5 - filled)
+end
+
+---Project page URL — the API's `url` when present, else built from the slug.
+local function project_page_url(project)
+	if project.url and project.url ~= "" then
+		return project.url
+	end
+	return BASE_URL .. "/project/" .. (project.slug or "")
+end
+
+---@param project table
+---@param ctx table { token, selection, set_selection, set_status, saved_folders }
+---@return userdata component
+local function build_card(project, ctx)
+	local slug = project.slug
+	local title = project.title or project.name or slug
+	local releases = project.releases_id or EMPTY_LIST
+	local newest = newest_release_id(releases)
+	local options = (#releases > 0) and releases or { "latest" }
+	local selected = ctx.selection[slug] or default_release(project)
+
+	-- Button verb (Update vs Download) from whether the folder the modal would prefill already exists.
+	local dest_folder = (ctx.saved_folders or EMPTY_LIST)[slug] or project.folder or slug
+	local already_here = folder_state(dest_folder)
+
+	local left = {}
+	local thumb = first_thumb(project.thumbnails)
+	if thumb and editor.ui.image then
+		left[#left + 1] = editor.ui.image({ image = thumb, width = 120 })
+	end
+
+	local title_row = {}
+	local stars = rating_stars(project.avg_rating, project.review_count)
+	if stars then
+		title_row[#title_row + 1] = editor.ui.label({
+			text = stars,
+			color = editor.ui.COLOR.HINT,
+		})
+	end
+	title_row[#title_row + 1] = editor.ui.heading({
+		text = title,
+		style = editor.ui.HEADING_STYLE.H5,
+	})
+	if project.visibility and project.visibility ~= "" then
+		title_row[#title_row + 1] = editor.ui.label({
+			text = "[" .. project.visibility .. "]",
+			color = (project.visibility == "private")
+				and editor.ui.COLOR.WARNING or editor.ui.COLOR.HINT,
+		})
+	end
+	if project.role and project.role ~= "" then
+		title_row[#title_row + 1] = editor.ui.label({
+			text = "(" .. project.role .. ")",
+			color = editor.ui.COLOR.HINT,
+		})
+	end
+	title_row[#title_row + 1] = editor.ui.horizontal({ grow = true })
+	title_row[#title_row + 1] = editor.ui.button({
+		icon = editor.ui.ICON.OPEN_RESOURCE,
+		on_pressed = function() editor.browse(project_page_url(project)) end,
+	})
+
+	local info = {
+		editor.ui.horizontal({ spacing = editor.ui.SPACING.SMALL, children = title_row }),
+	}
+	if project.owner and project.owner ~= "" then
+		info[#info + 1] = editor.ui.label({
+			text = "by " .. project.owner,
+			color = editor.ui.COLOR.OVERRIDE,
+		})
+	end
+	if project.description and project.description ~= "" then
+		info[#info + 1] = editor.ui.paragraph({
+			text = project.description,
+			color = editor.ui.COLOR.TEXT,
+		})
+	end
+	-- Content tallies (nil ones skipped). Assets hide a 0; tilemaps/tilesets keep it (meaningful when a project is one-or-the-other).
+	local meta = {}
+	meta[#meta + 1] = tally_label(project.tilemap_count, project.tilemaps, "tilemap")
+	meta[#meta + 1] = tally_label(project.tileset_count, project.tilesets, "tileset")
+	meta[#meta + 1] = tally_label(project.asset_count, project.assets, "asset", true)
+	if #meta > 0 then
+		info[#info + 1] = editor.ui.label({
+			text = table.concat(meta, " · "),
+			color = editor.ui.COLOR.HINT,
+		})
+	end
+
+	-- downloadable=false (paid & not owned) => send to the project page instead of offering a download.
+	if project.downloadable == false then
+		info[#info + 1] = editor.ui.button({
+			text = "Get this project",
+			on_pressed = function()
+				if project.url and project.url ~= "" then
+					editor.browse(project.url)
+				end
+			end,
+		})
+	else
+		info[#info + 1] = editor.ui.horizontal({
+			spacing = editor.ui.SPACING.SMALL,
+			children = {
+				editor.ui.select_box({
+					value = selected,
+					options = options,
+					to_string = function(id) return release_label(id, newest) end,
+					on_value_changed = function(id)
+						ctx.set_selection(with_key(ctx.selection, slug, id))
+					end,
+					grow = true,
+				}),
+				editor.ui.button({
+					text = already_here and "Update" or "Download",
+					on_pressed = function() download_project(project, ctx) end,
+				}),
+			},
+		})
+	end
+
+	local row = {}
+	if #left > 0 then
+		row[#row + 1] = editor.ui.vertical({ children = left })
+	end
+	row[#row + 1] = editor.ui.vertical({
+		grow = true,
+		spacing = editor.ui.SPACING.SMALL,
+		children = info,
+	})
+
+	return editor.ui.vertical({
+		spacing = editor.ui.SPACING.SMALL,
+		children = {
+			editor.ui.horizontal({ spacing = editor.ui.SPACING.MEDIUM, children = row }),
+			editor.ui.separator({}),
+		},
+	})
+end
+
+-- ----------------------------------------------------------------------------
+-- Downloaded tab (local registry, enriched from the API for update controls)
+-- ----------------------------------------------------------------------------
+
+---Base list for the Downloaded tab from prefs, keeping only slugs whose folder still exists on disk.
+---@return table records array of { slug, title, folder } sorted by title
+local function load_downloaded_records()
+	local folders = editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST
+	local titles = editor.prefs.get(PREF_TITLES) or EMPTY_LIST
+	local out = {}
+	for slug, folder in pairs(folders) do
+		local exists, is_file = folder_state(folder)
+		if exists and not is_file then
+			out[#out + 1] = { slug = slug, title = titles[slug] or slug, folder = folder }
+		end
+	end
+	table.sort(out, function(a, b) return string.lower(a.title) < string.lower(b.title) end)
+	return out
+end
+
+---Move every project in `list` whose slug is still in `remaining` into `by_slug` and mark it resolved.
+---@param by_slug table slug -> full project record (accumulator)
+---@param remaining table slug -> true (still unresolved; entries removed here)
+---@param list table|nil array of project records from an endpoint
+local function resolve_from_list(by_slug, remaining, list)
+	if type(list) ~= "table" then return end
+	for _, project in ipairs(list) do
+		if project.slug and remaining[project.slug] then
+			by_slug[project.slug] = project
+			remaining[project.slug] = nil
+		end
+	end
+end
+
+---Attach each downloaded record's full API record (record.project) for update controls.
+---Order stops when all resolve: my_projects → collaborations → public(slug=csv) → purchases.
+---Owner/collaborator endpoints go first so an owned public project keeps its "dev" build (public strips it).
+---@param records table array of { slug, title, folder }
+---@param token string
+local function enrich_downloaded(records, token)
+	if #records == 0 then return end
+
+	local remaining, slugs = {}, {}
+	for _, r in ipairs(records) do
+		remaining[r.slug] = true
+		slugs[#slugs + 1] = r.slug
+	end
+	local function any_remaining()
+		return next(remaining) ~= nil
+	end
+
+	local by_slug = {}
+	local b = api_get("get_my_projects", token)
+	resolve_from_list(by_slug, remaining, b and b.projects)
+
+	if any_remaining() then
+		b = api_get("get_collaborations", token)
+		resolve_from_list(by_slug, remaining, b and b.collaborations)
+	end
+
+	if any_remaining() then
+		b = api_get("get_public_projects", token, {
+			slug = table.concat(slugs, ","),
+			per_page = 50,
+			page = 1,
+		})
+		resolve_from_list(by_slug, remaining, b and b.projects)
+	end
+
+	if any_remaining() then
+		b = api_get("get_purchases", token)
+		resolve_from_list(by_slug, remaining, b and b.purchases)
+	end
+
+	for _, r in ipairs(records) do
+		r.project = by_slug[r.slug]
+	end
+end
+
+-- Delete confirmation; "Delete" is NOT the default button, so Enter can't trigger it by accident.
+local delete_dialog = editor.ui.component(function(props)
+	return editor.ui.dialog({
+		title = "Delete project",
+		content = editor.ui.vertical({
+			padding = editor.ui.PADDING.LARGE,
+			spacing = editor.ui.SPACING.MEDIUM,
+			children = {
+				editor.ui.paragraph({
+					text = 'This permanently deletes the folder "/' .. props.folder .. '" and all its '
+						.. 'files from this project. This cannot be undone.',
+					color = editor.ui.COLOR.TEXT,
+				}),
+			},
+		}),
+		buttons = {
+			editor.ui.dialog_button({ text = "Cancel", cancel = true }),
+			editor.ui.dialog_button({ text = "Delete", result = "delete" }),
+		},
+	})
+end)
+
+---Card for a downloaded project: title (+ thumbnail), download path, update control (when resolved), and Delete.
+---@param record table { slug, title, folder, project? }
+---@param ctx table { token, selection, set_selection, set_status, remove_downloaded }
+---@return userdata component
+local function build_downloaded_card(record, ctx)
+	local project = record.project
+
+	local left = {}
+	local thumb = project and first_thumb(project.thumbnails)
+	if thumb and editor.ui.image then
+		left[#left + 1] = editor.ui.image({ image = thumb, width = 96 })
+	end
+
+	local page_url = (project and project.url and project.url ~= "" and project.url)
+		or (BASE_URL .. "/project/" .. record.slug)
+	local title_row = {
+		editor.ui.heading({ text = record.title, style = editor.ui.HEADING_STYLE.H5 }),
+		editor.ui.horizontal({ grow = true }),
+		editor.ui.button({
+			icon = editor.ui.ICON.OPEN_RESOURCE,
+			on_pressed = function() editor.browse(page_url) end,
+		}),
+	}
+
+	local info = {
+		editor.ui.horizontal({ spacing = editor.ui.SPACING.SMALL, children = title_row }),
+		editor.ui.label({ text = "Downloaded to /" .. record.folder, color = editor.ui.COLOR.HINT }),
+	}
+
+	-- Update control only when the project resolved from the API and is downloadable; re-downloads in place.
+	if project and project.downloadable ~= false then
+		local releases = project.releases_id or EMPTY_LIST
+		local newest = newest_release_id(releases)
+		local options = (#releases > 0) and releases or { "latest" }
+		local selected = ctx.selection[record.slug] or default_release(project)
+		info[#info + 1] = editor.ui.horizontal({
+			spacing = editor.ui.SPACING.SMALL,
+			children = {
+				editor.ui.select_box({
+					value = selected,
+					options = options,
+					to_string = function(id) return release_label(id, newest) end,
+					on_value_changed = function(id)
+						ctx.set_selection(with_key(ctx.selection, record.slug, id))
+					end,
+					grow = true,
+				}),
+				editor.ui.button({
+					text = "Update",
+					on_pressed = function() download_project(project, ctx) end,
+				}),
+			},
+		})
+	end
+
+	info[#info + 1] = editor.ui.button({
+		text = "Delete",
+		on_pressed = function()
+			local decision = editor.ui.show_dialog(delete_dialog({
+				folder = record.folder,
+				title = record.title,
+			}))
+			if decision ~= "delete" then
+				return
+			end
+			local slug, folder, ttl = record.slug, record.folder, record.title
+			-- Update the UI BEFORE the delete: editor.delete_directory consumes the render cycle, so a
+			-- set_status / list update after it wouldn't repaint until the next event. Delete + prefs run last.
+			ctx.remove_downloaded(slug)
+			ctx.set_status("Deleted '" .. ttl .. "' (/" .. folder .. ").")
+			local ok, err = pcall(editor.delete_directory, "/" .. folder)
+			if ok then
+				editor.prefs.set(PREF_FOLDERS, without_key(editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST, slug))
+				editor.prefs.set(PREF_TITLES, without_key(editor.prefs.get(PREF_TITLES) or EMPTY_LIST, slug))
+				print("[Tilemaps Store] Deleted '" .. ttl .. "' (/" .. folder .. ")")
+			else
+				-- Rare (e.g. a locked file): optimistic UI is ahead of disk, but prefs/folder are intact,
+				-- so the entry reappears on the next reload. Log it since the bar can't repaint a correction.
+				print("[Tilemaps Store] Delete failed for /" .. folder .. ": " .. tostring(err))
+			end
+		end,
+	})
+
+	local row = {}
+	if #left > 0 then
+		row[#row + 1] = editor.ui.vertical({ children = left })
+	end
+	row[#row + 1] = editor.ui.vertical({
+		grow = true,
+		spacing = editor.ui.SPACING.SMALL,
+		children = info,
+	})
+
+	return editor.ui.vertical({
+		spacing = editor.ui.SPACING.SMALL,
+		children = {
+			editor.ui.horizontal({ spacing = editor.ui.SPACING.MEDIUM, children = row }),
+			editor.ui.separator({}),
+		},
+	})
+end
+
+-- ----------------------------------------------------------------------------
+-- Main store dialog (reactive component)
+-- ----------------------------------------------------------------------------
+
+local store_dialog = editor.ui.component(function(props)
+	local token = props.token
+	local tab, set_tab = editor.ui.use_state("marketplace")
+	local query, set_query = editor.ui.use_state("")
+	local marketplace, set_marketplace = editor.ui.use_state(props.initial_marketplace)
+	local my, set_my = editor.ui.use_state(NOT_LOADED)                     -- lazy
+	local collaborations, set_collaborations = editor.ui.use_state(NOT_LOADED)
+	local purchases, set_purchases = editor.ui.use_state(NOT_LOADED)
+	local downloaded, set_downloaded = editor.ui.use_state(NOT_LOADED)       -- local registry
+	local selection, set_selection = editor.ui.use_state(new_map)
+	local status, set_status = editor.ui.use_state(props.initial_status or "")
+
+	local source = my
+	if tab == "collaborations" then
+		source = collaborations
+	elseif tab == "purchases" then
+		source = purchases
+	elseif tab == "downloaded" then
+		source = downloaded
+	end
+	local source_list = (source == NOT_LOADED) and EMPTY_LIST or source
+	local filtered = editor.ui.use_memo(filter_by_title, source_list, query)
+
+	-- Loaders — only ever called from callbacks, never in render.
+	local function reload_marketplace(page, search)
+		local body, err = api_get("get_public_projects", token, {
+			page = page,
+			per_page = PER_PAGE,
+			q = search,
+		})
+		if err then
+			set_status("Error: " .. err)
+			return
+		end
+		set_marketplace(make_marketplace(body))
+		set_status("")
+	end
+
+	local function load_list(method, key, setter)
+		local body, err = api_get(method, token)
+		if err then
+			set_status("Error: " .. err)
+			return
+		end
+		setter((body and body[key]) or {})
+		set_status("")
+	end
+
+	-- Downloaded: read prefs + re-check folders, then enrich via the API. Reloads on every activation.
+	local function reload_downloaded()
+		local records = load_downloaded_records()
+		enrich_downloaded(records, token)
+		set_downloaded(records)
+	end
+
+	-- Drop one entry locally (no API); delete uses this before editor.delete_directory so the UI repaints.
+	local function remove_downloaded(slug)
+		if downloaded == NOT_LOADED then
+			return
+		end
+		local out = {}
+		for _, r in ipairs(downloaded) do
+			if r.slug ~= slug then
+				out[#out + 1] = r
+			end
+		end
+		set_downloaded(out)
+	end
+
+	local list = (tab == "marketplace") and marketplace.items or filtered
+
+	-- Read once so build_card can label its button Update vs Download.
+	local saved_folders = editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST
+
+	local cards = {}
+	for _, project in ipairs(list) do
+		if tab == "downloaded" then
+			cards[#cards + 1] = build_downloaded_card(project, {
+				token = token,
+				selection = selection,
+				set_selection = set_selection,
+				set_status = set_status,
+				remove_downloaded = remove_downloaded,
+			})
+		else
+			cards[#cards + 1] = build_card(project, {
+				token = token,
+				selection = selection,
+				set_selection = set_selection,
+				set_status = set_status,
+				saved_folders = saved_folders,
+			})
+		end
+	end
+	if #cards == 0 then
+		local empty_text = "No projects found."
+		if query == "" then
+			if tab == "my" and my ~= NOT_LOADED then
+				empty_text = "You don't have any projects yet."
+			elseif tab == "collaborations" and collaborations ~= NOT_LOADED then
+				empty_text = "You don't collaborate on any project yet."
+			elseif tab == "purchases" and purchases ~= NOT_LOADED then
+				empty_text = "You haven't purchased any projects yet."
+			elseif tab == "downloaded" and downloaded ~= NOT_LOADED then
+				empty_text = "No downloaded projects found on disk yet."
+			end
+		end
+		cards[1] = editor.ui.label({ text = empty_text, color = editor.ui.COLOR.HINT })
+	end
+
+	-- One tab button; loads its data lazily on first activation.
+	local function tab_button(label, id)
+		return editor.ui.button({
+			text = label,
+			enabled = tab ~= id,
+			on_pressed = function()
+				set_tab(id)
+				set_query("")
+				if id == "marketplace" then
+					reload_marketplace(1, "")
+				elseif id == "my" and my == NOT_LOADED then
+					load_list("get_my_projects", "projects", set_my)
+				elseif id == "collaborations" and collaborations == NOT_LOADED then
+					load_list("get_collaborations", "collaborations", set_collaborations)
+				elseif id == "purchases" and purchases == NOT_LOADED then
+					load_list("get_purchases", "purchases", set_purchases)
+				elseif id == "downloaded" then
+					reload_downloaded()
+				end
+			end,
+		})
+	end
+
+	local header_children = {
+		editor.ui.horizontal({
+			spacing = editor.ui.SPACING.SMALL,
+			children = {
+				tab_button("Explore", "marketplace"),
+				tab_button("My Projects", "my"),
+				tab_button("My Collaborations", "collaborations"),
+				tab_button("My Purchases", "purchases"),
+				tab_button("Downloaded", "downloaded"),
+			},
+		}),
+		editor.ui.string_field({
+			value = query,
+			on_value_changed = function(text)
+				set_query(text)
+				if tab == "marketplace" then
+					reload_marketplace(1, text)
+				end
+			end,
+		}),
+	}
+
+	local body_children = {
+		editor.ui.vertical({ spacing = editor.ui.SPACING.SMALL, children = header_children }),
+		editor.ui.separator({}),
+	}
+
+	if tab == "marketplace" and marketplace.total_pages > 1 then
+		local page = marketplace.page
+		local total = marketplace.total_pages
+		body_children[#body_children + 1] = editor.ui.horizontal({
+			spacing = editor.ui.SPACING.SMALL,
+			alignment = editor.ui.ALIGNMENT.CENTER,
+			children = {
+				editor.ui.button({
+					text = "◀ Prev",
+					enabled = page > 1,
+					on_pressed = function() reload_marketplace(page - 1, query) end,
+				}),
+				editor.ui.label({ text = "Page " .. page .. " / " .. total }),
+				editor.ui.button({
+					text = "Next ▶",
+					enabled = page < total,
+					on_pressed = function() reload_marketplace(page + 1, query) end,
+				}),
+			},
+		})
+	end
+
+	body_children[#body_children + 1] = editor.ui.scroll({
+		grow = true,
+		content = editor.ui.vertical({ spacing = editor.ui.SPACING.LARGE, children = cards }),
+	})
+
+	if status ~= "" then
+		body_children[#body_children + 1] = editor.ui.label({
+			text = status,
+			color = editor.ui.COLOR.HINT,
+		})
+	end
+
+	return editor.ui.dialog({
+		title = "Tilemaps Store",
+		header = editor.ui.horizontal({
+			spacing = editor.ui.SPACING.MEDIUM,
+			alignment = editor.ui.ALIGNMENT.CENTER,
+			children = {
+				editor.ui.image({ image = LOGO_URL, height = 28 }),
+				editor.ui.horizontal({ grow = true }),
+				editor.ui.label({
+					text = props.username and ("@" .. props.username) or "",
+					color = editor.ui.COLOR.HINT,
+				}),
+				editor.ui.button({
+					text = "Profile",
+					enabled = props.username ~= nil,
+					on_pressed = function()
+						if props.username then
+							editor.browse(BASE_URL .. "/user/" .. props.username)
+						end
+					end,
+				}),
+			},
+		}),
+		content = editor.ui.vertical({
+			padding = editor.ui.PADDING.MEDIUM,
+			spacing = editor.ui.SPACING.MEDIUM,
+			children = body_children,
+		}),
+		buttons = {
+			editor.ui.dialog_button({ text = "Close", cancel = true }),
+		},
+	})
+end)
+
+-- ----------------------------------------------------------------------------
+-- Entry point
+-- ----------------------------------------------------------------------------
+
+local function open_store()
+	local token = editor.prefs.get(PREF_TOKEN) or ""
+
+	-- Validate the saved token by fetching the first marketplace page; prompt when missing or rejected.
+	local body, err
+	if token ~= "" then
+		body, err = api_get("get_public_projects", token, { page = 1, per_page = PER_PAGE })
+	end
+	if token == "" or err == "unauthorized" then
+		token = prompt_for_token(token == "" and nil
+			or "Your saved token is invalid. Enter a new one.")
+		if not token then
+			return
+		end
+		body, err = api_get("get_public_projects", token, { page = 1, per_page = PER_PAGE })
+	end
+
+	local me = api_get("get_me", token)
+	local username = type(me) == "table" and me.username or nil
+
+	editor.ui.show_dialog(store_dialog({
+		token = token,
+		username = username,
+		initial_marketplace = make_marketplace(body),
+		initial_status = err and ("Error: " .. err) or "",
+	}))
+end
+
+-- ----------------------------------------------------------------------------
+-- Editor script interface
+-- ----------------------------------------------------------------------------
+
+function M.get_prefs_schema()
+	return {
+		[PREF_TOKEN] = editor.prefs.schema.password({
+			scope = editor.prefs.SCOPE.GLOBAL,
+		}),
+		[PREF_OVERWRITE] = editor.prefs.schema.set({
+			item = editor.prefs.schema.string(),
+			scope = editor.prefs.SCOPE.PROJECT,
+		}),
+		[PREF_NO_ASSETS] = editor.prefs.schema.set({
+			item = editor.prefs.schema.string(),
+			scope = editor.prefs.SCOPE.PROJECT,
+		}),
+		[PREF_FOLDERS] = editor.prefs.schema.object_of({
+			key = editor.prefs.schema.string(),
+			val = editor.prefs.schema.string(),
+			scope = editor.prefs.SCOPE.PROJECT,
+		}),
+		[PREF_TITLES] = editor.prefs.schema.object_of({
+			key = editor.prefs.schema.string(),
+			val = editor.prefs.schema.string(),
+			scope = editor.prefs.SCOPE.PROJECT,
+		}),
+	}
+end
+
+function M.get_commands()
+	return {
+		{
+			label = "Tilemaps Store",
+			locations = { "Project" },
+			run = open_store,
+		},
+	}
+end
+
+return M
