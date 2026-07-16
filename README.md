@@ -60,7 +60,7 @@ Every card shows a thumbnail, a content summary (tilemaps · tilesets · assets)
 Each project's version selector offers up to two kinds of versions:
 
 - **Development build** — the project's live, work-in-progress build. It always reflects the *current* state of the project on Tilemaps.com and can change at any time. This option appears for projects **you own** (in **My Projects**) as well as projects **you collaborate on** (in **My Collaborations**), and is the default selection when available.
-- **Releases** — immutable, published snapshots (`Release #1`, `Release #2`, …). The most recent one is marked **(latest)**. Releases never change once published, so they're what you'll typically ship with — everyone (buyers and collaborators) picks a release.
+- **Releases** — immutable, published snapshots (`Release #1`, `Release #2`, …). The most recent one is marked **(latest)**. Releases never change once published, so they're what you'll typically ship with.
 
 ### Updating an imported project
 
