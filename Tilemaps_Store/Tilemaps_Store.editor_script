@@ -31,9 +31,8 @@ local PREF_NO_ASSETS = "tilemaps_store.exclude_assets_slugs"  -- slugs with "Inc
 local PREF_FOLDERS   = "tilemaps_store.folders"               -- slug -> chosen destination folder
 local PREF_TITLES    = "tilemaps_store.downloaded_titles"     -- slug -> title (for the Downloaded tab)
 
--- Stable refs reused across re-renders (a fresh literal each render would reset state / re-run memos).
 local EMPTY_LIST = {}
-local NOT_LOADED = {}   -- sentinel: list not fetched yet (distinct from [])
+local NOT_LOADED = {}
 local function new_map() return {} end
 
 -- ----------------------------------------------------------------------------
