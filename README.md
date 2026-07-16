@@ -32,7 +32,7 @@ Tilemaps Store is a Defold **editor script** and installs like any other Defold 
 
 Once the library is fetched, open the store from the editor's **Project** menu → **Tilemaps Store**.
 
-## Getting started — your API token
+## Getting started
 
 The first time you open **Tilemaps Store**, it asks for your **Tilemaps.com API token**.
 
@@ -41,7 +41,7 @@ The first time you open **Tilemaps Store**, it asks for your **Tilemaps.com API 
 
 Your token is stored securely in the editor's global preferences, so you only enter it once. If a saved token ever stops working, the store re-prompts you for a new one.
 
-## The store tabs
+## Tabs
 
 Once connected, the store opens as a single dialog with five tabs:
 
