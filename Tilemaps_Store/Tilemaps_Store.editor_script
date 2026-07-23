@@ -25,11 +25,12 @@ local BINARY_EXT = {
 	otf = true, zip = true, glb = true, gltf = true, bin = true, jar = true,
 }
 
-local PREF_TOKEN     = "tilemaps_store.api_token"
-local PREF_OVERWRITE = "tilemaps_store.overwrite_slugs"       -- slugs with "Overwrite" checked
-local PREF_NO_ASSETS = "tilemaps_store.exclude_assets_slugs"  -- slugs with "Include assets" unchecked
-local PREF_FOLDERS   = "tilemaps_store.folders"               -- slug -> chosen destination folder
-local PREF_TITLES    = "tilemaps_store.downloaded_titles"     -- slug -> title (for the Downloaded tab)
+local PREF_TOKEN           = "tilemaps_store.api_token"
+local PREF_OVERWRITE       = "tilemaps_store.overwrite_slugs"        -- slugs with "Overwrite" checked
+local PREF_NO_ASSETS       = "tilemaps_store.exclude_assets_slugs"   -- slugs with "Include assets" unchecked
+local PREF_KEEP_COLLECTION = "tilemaps_store.keep_collection_slugs"  -- slugs with "Convert to tile map" unchecked
+local PREF_FOLDERS         = "tilemaps_store.folders"                -- slug -> chosen destination folder
+local PREF_TITLES          = "tilemaps_store.downloaded_titles"      -- slug -> title (for the Downloaded tab)
 
 local EMPTY_LIST = {}
 local NOT_LOADED = {}
@@ -270,12 +271,338 @@ local function adapt_resource_paths(extract_dir, user_root)
 	end
 end
 
+-- ----------------------------------------------------------------------------
+-- Collection -> native .tilemap conversion (orthogonal maps only)
+-- ----------------------------------------------------------------------------
+-- Tilemaps.com always exports Defold projects as a .collection — one child .go per layer, one
+-- sprite component per tile — because that's the only format that covers isometric projection
+-- and per-tile animation. For a large, purely orthogonal map that flexibility costs runtime
+-- performance: hundreds or thousands of game objects instead of a single Tile Map component.
+-- When the user opts in, we detect orthogonal, single-tileset, sprite-grid collections from
+-- their own file shape (no server round-trip) and replace them with a native .tilemap wrapped
+-- by a plain .go (Defold's Tile Map component always needs a game object to live in — a
+-- .collection can't reference one directly). The original .collection is removed rather than
+-- kept as a compatibility shim: this is an explicit, reversible opt-in, so anyone who needs the
+-- multi-layer .collection back can simply download again with the option unchecked. Isometric
+-- or otherwise non-grid collections are left untouched.
+
+local GRID_EPSILON = 0.01  -- world units of slack when checking tile-center alignment
+
+---Read a whole file as text, or nil if it can't be opened.
+---@param path string absolute path
+---@return string|nil
+local function read_file(path)
+	local fh = io.open(path, "rb")
+	if not fh then return nil end
+	local content = fh:read("*a")
+	fh:close()
+	return content
+end
+
+---Write `content` to `path` (created/truncated). Returns true on success.
+---@param path string absolute path
+---@param content string
+---@return boolean
+local function write_file(path, content)
+	local fh = io.open(path, "wb")
+	if not fh then return false end
+	local ok = fh:write(content)
+	fh:close()
+	return ok ~= nil
+end
+
+---Format a number for Defold's protobuf text format: always carries a decimal point.
+---@param n number
+---@return string
+local function fmt_float(n)
+	local s = string.format("%.6g", n)
+	if not s:find("[%.eE]") then
+		s = s .. ".0"
+	end
+	return s
+end
+
+---Root-relative resource path (e.g. "/folder/x.go") -> absolute filesystem path. The inverse of `res_path`.
+---@param res string
+---@param root_abs string project root (absolute)
+---@return string
+local function resolve_resource(res, root_abs)
+	return root_abs .. PATH_SEP .. (res:gsub("^/", ""):gsub("/", PATH_SEP))
+end
+
+---Is `value` within `eps` of an integer?
+---@param value number
+---@param eps number
+---@return boolean
+local function near_integer(value, eps)
+	return math.abs(value - math.floor(value + 0.5)) < eps
+end
+
+---Parse `id`/`prototype` out of every top-level `instances { ... }` block, in file order. nil when
+---the collection has no instances, or uses `embedded_instances` (inlined children — too irregular
+---to reason about safely).
+---@param text string .collection content
+---@return table[]|nil instances array of { id, prototype }
+local function parse_collection_instances(text)
+	if text:find("embedded_instances", 1, true) then
+		return nil
+	end
+	local out = {}
+	for block in text:gmatch("instances%s*(%b{})") do
+		local id = block:match('id:%s*"([^"]*)"')
+		local prototype = block:match('prototype:%s*"([^"]*)"')
+		if not id or not prototype then
+			return nil
+		end
+		out[#out + 1] = { id = id, prototype = prototype }
+	end
+	if #out == 0 then
+		return nil
+	end
+	return out
+end
+
+---Parse every `components { ... }` block of a .go file as a sprite-tile placement. nil when any
+---component isn't a plain sprite reference with a position, or the file uses `embedded_components`
+---— that .go isn't a pure per-tile sprite layer. An empty (but valid) result is a layer with no tiles.
+---@param text string .go content
+---@return table[]|nil cells array of { sprite = path, x, y, z }
+local function parse_go_sprite_cells(text)
+	if text:find("embedded_components", 1, true) then
+		return nil
+	end
+	local out = {}
+	for block in text:gmatch("components%s*(%b{})") do
+		local sprite = block:match('component:%s*"([^"]*%.sprite)"')
+		local pos = block:match("position%s*(%b{})")
+		if not sprite or not pos then
+			return nil
+		end
+		local x = tonumber(pos:match("x:%s*([%-%d%.]+)"))
+		local y = tonumber(pos:match("y:%s*([%-%d%.]+)"))
+		local z = tonumber(pos:match("z:%s*([%-%d%.]+)")) or 0
+		if not x or not y then
+			return nil
+		end
+		out[#out + 1] = { sprite = sprite, x = x, y = y, z = z }
+	end
+	return out
+end
+
+---@param text string .sprite content
+---@return string|nil tile_set resource path
+---@return string|nil default_animation
+local function parse_sprite(text)
+	return text:match('tile_set:%s*"([^"]*)"'), text:match('default_animation:%s*"([^"]*)"')
+end
+
+---@param text string .tilesource content
+---@return integer|nil tile_width
+---@return integer|nil tile_height
+---@return table|nil starts animation id (string) -> start_tile (integer)
+local function parse_tilesource(text)
+	local tw = tonumber(text:match("tile_width:%s*(%d+)"))
+	local th = tonumber(text:match("tile_height:%s*(%d+)"))
+	if not tw or not th then
+		return nil
+	end
+	local starts = {}
+	for block in text:gmatch("animations%s*(%b{})") do
+		local id = block:match('id:%s*"([^"]*)"')
+		local start_tile = tonumber(block:match("start_tile:%s*(%d+)"))
+		if not id or not start_tile then
+			return nil
+		end
+		starts[id] = start_tile
+	end
+	return tw, th, starts
+end
+
+---Try to convert one exported map collection into a native, orthogonal .tilemap. Best-effort and
+---read-only until every check passes — anything that doesn't match the expected shape (multiple
+---tilesets, isometric placement, embedded content, …) leaves the collection untouched.
+---@param collection_abs string absolute path to the .collection file
+---@param root_abs string project root (absolute)
+---@return "converted"|"isometric"|nil status
+---@return string[]|nil sprites resource paths freed by the conversion (status == "converted" only)
+local function try_convert_collection(collection_abs, root_abs)
+	local coll_text = read_file(collection_abs)
+	if not coll_text then return nil end
+
+	local instances = parse_collection_instances(coll_text)
+	if not instances then return nil end
+
+	-- Resolve + parse every referenced .go as one layer, in instance order.
+	local layers, go_abs_paths = {}, {}
+	for _, inst in ipairs(instances) do
+		if file_ext(inst.prototype) ~= "go" then
+			return nil
+		end
+		local go_abs = resolve_resource(inst.prototype, root_abs)
+		local go_text = read_file(go_abs)
+		if not go_text then return nil end
+		local cells = parse_go_sprite_cells(go_text)
+		if not cells then return nil end
+		go_abs_paths[#go_abs_paths + 1] = go_abs
+		layers[#layers + 1] = { id = inst.id, cells = cells, z = cells[1] and cells[1].z or 0 }
+	end
+
+	-- Resolve each cell's sprite -> (shared tileset, animation id); bail on more than one tileset.
+	local sprite_cache, tile_set_path = {}, nil
+	for _, layer in ipairs(layers) do
+		for _, cell in ipairs(layer.cells) do
+			local resolved = sprite_cache[cell.sprite]
+			if not resolved then
+				local sprite_text = read_file(resolve_resource(cell.sprite, root_abs))
+				if not sprite_text then return nil end
+				local ts, anim = parse_sprite(sprite_text)
+				if not ts or not anim then return nil end
+				resolved = { tile_set = ts, anim = anim }
+				sprite_cache[cell.sprite] = resolved
+			end
+			if not tile_set_path then
+				tile_set_path = resolved.tile_set
+			elseif tile_set_path ~= resolved.tile_set then
+				return nil
+			end
+			cell.anim = resolved.anim
+		end
+	end
+	if not tile_set_path then return nil end
+
+	local tileset_text = read_file(resolve_resource(tile_set_path, root_abs))
+	if not tileset_text then return nil end
+	local tile_w, tile_h, starts = parse_tilesource(tileset_text)
+	if not tile_w or not tile_h then return nil end
+
+	-- Grid check + tile-id resolution in one pass: any cell off the orthogonal lattice flips the
+	-- verdict to isometric (tilemaps.com's isometric export offsets tile centers by half a cell
+	-- per row/column instead of landing on this rectangular grid).
+	local half_w, half_h = tile_w / 2, tile_h / 2
+	for _, layer in ipairs(layers) do
+		for _, cell in ipairs(layer.cells) do
+			local col_f = (cell.x - half_w) / tile_w
+			local row_f = (cell.y - half_h) / tile_h
+			if not (near_integer(col_f, GRID_EPSILON) and near_integer(row_f, GRID_EPSILON)) then
+				return "isometric"
+			end
+			-- Tilesource `start_tile` is 1-based; a .tilemap cell's `tile` is 0-based (0 = first tile),
+			-- so drop by one. The sprite that renders tilesource tile N is named tile_(N-1).sprite, so
+			-- the result equals that suffix — a handy cross-check.
+			local start_tile = starts[cell.anim]
+			if not start_tile then return nil end
+			cell.col, cell.row, cell.tile = math.floor(col_f + 0.5), math.floor(row_f + 0.5), start_tile - 1
+		end
+	end
+
+	-- Build the native .tilemap text.
+	local parts = { 'tile_set: "' .. tile_set_path .. '"\n' }
+	for _, layer in ipairs(layers) do
+		parts[#parts + 1] = 'layers {\n  id: "' .. layer.id .. '"\n  z: ' .. fmt_float(layer.z) .. '\n'
+		for _, cell in ipairs(layer.cells) do
+			parts[#parts + 1] = string.format(
+				"  cell {\n    x: %d\n    y: %d\n    tile: %d\n  }\n", cell.col, cell.row, cell.tile)
+		end
+		parts[#parts + 1] = "}\n"
+	end
+	parts[#parts + 1] = 'material: "/builtins/materials/tile_map.material"\n'
+
+	-- Sibling filenames next to the original .collection, which is removed below — its base name
+	-- is free to reuse, so the replacement pair reads as "<name>.go" + "<name>.tilemap".
+	local coll_name_file = basename(collection_abs)
+	local dir = collection_abs:sub(1, #collection_abs - #coll_name_file - 1)
+	local base = coll_name_file:gsub("%.collection$", "")
+	local tilemap_abs = dir .. PATH_SEP .. base .. ".tilemap"
+	local go_abs = dir .. PATH_SEP .. base .. ".go"
+
+	if not write_file(tilemap_abs, table.concat(parts)) then return nil end
+
+	local root_len = #to_slash(root_abs)
+	local tilemap_res = res_path(tilemap_abs, root_len)
+	if not write_file(go_abs, 'components {\n  id: "tilemap"\n  component: "' .. tilemap_res .. '"\n}\n') then
+		return nil
+	end
+
+	-- Both new files are down; the .collection's job is done — drop it along with the per-layer
+	-- .go files it used to wrap (exclusively owned by this collection, so always safe to remove).
+	os.remove(collection_abs)
+	for _, path in ipairs(go_abs_paths) do
+		os.remove(path)
+	end
+
+	local sprite_candidates = {}
+	for sprite_path in pairs(sprite_cache) do
+		sprite_candidates[#sprite_candidates + 1] = sprite_path
+	end
+	return "converted", sprite_candidates
+end
+
+---Delete any of `sprite_paths` no longer referenced by any .go/.collection still present under
+---`target_dir` — the only file types that can hold such a reference. Called once after every
+---collection in a download has been converted, so a sprite shared across two map collections
+---(unusual, but possible) survives until both have had their say.
+---@param sprite_paths string[] root-relative resource paths
+---@param root_abs string project root (absolute)
+---@param target_dir string absolute path of the just-downloaded folder
+local function delete_unused_sprites(sprite_paths, root_abs, target_dir)
+	if #sprite_paths == 0 then return end
+
+	local haystack = {}
+	for _, f in ipairs(list_files_recursive(target_dir)) do
+		local ext = file_ext(basename(f))
+		if ext == "go" or ext == "collection" then
+			haystack[#haystack + 1] = read_file(f) or ""
+		end
+	end
+	local blob = table.concat(haystack, "\n")
+
+	local seen = {}
+	for _, res in ipairs(sprite_paths) do
+		if not seen[res] then
+			seen[res] = true
+			if not blob:find(res, 1, true) then
+				os.remove(resolve_resource(res, root_abs))
+			end
+		end
+	end
+end
+
+---Convert every orthogonal, single-tileset, sprite-grid .collection under `target_dir` into a
+---native .tilemap. Best-effort per file: a parse/shape failure just skips that file.
+---@param target_dir string absolute path of the just-extracted download folder
+---@param root_abs string project root (absolute)
+---@return integer converted
+---@return integer isometric kept as .collection because they aren't an orthogonal grid
+local function convert_orthogonal_collections(target_dir, root_abs)
+	local converted, isometric, freed = 0, 0, {}
+	for _, f in ipairs(list_files_recursive(target_dir)) do
+		if file_ext(basename(f)) == "collection" then
+			local ok, status, sprites = pcall(try_convert_collection, f, root_abs)
+			if ok and status == "converted" then
+				converted = converted + 1
+				for _, s in ipairs(sprites) do
+					freed[#freed + 1] = s
+				end
+				print("[Tilemaps Store] Converted '" .. basename(f) .. "' to a native tile map.")
+			elseif ok and status == "isometric" then
+				isometric = isometric + 1
+				print("[Tilemaps Store] Kept '" .. basename(f) .. "' as a collection (isometric map).")
+			elseif not ok then
+				print("[Tilemaps Store] Tile map conversion failed for '" .. basename(f) .. "': " .. tostring(status))
+			end
+		end
+	end
+	delete_unused_sprites(freed, root_abs, target_dir)
+	return converted, isometric
+end
+
 ---Download a project ZIP and extract its whole contents into /<folder>/ (created if missing), then adapt paths.
 ---@param url string
 ---@param folder string destination folder name (project.folder)
----@param opts table { token = string, overwrite = boolean, include_assets = boolean }
+---@param opts table { token = string, overwrite = boolean, include_assets = boolean, convert_tilemap = boolean }
 ---@return boolean success
 ---@return string|nil err
+---@return string|nil convert_note summary of any .collection -> .tilemap conversions performed
 local function download_and_extract(url, folder, opts)
 	-- Resolve absolute paths via the editor (subprocess CWD is not the project root).
 	local internal = editor.external_file_attributes(".internal")
@@ -314,7 +641,23 @@ local function download_and_extract(url, folder, opts)
 	end
 
 	pcall(adapt_resource_paths, target, root.path)
-	return true, nil
+
+	local convert_note
+	if opts.convert_tilemap then
+		local converted, isometric = convert_orthogonal_collections(target, root.path)
+		if converted > 0 or isometric > 0 then
+			local bits = {}
+			if converted > 0 then
+				bits[#bits + 1] = converted .. (converted == 1 and " map" or " maps") .. " converted to native tile maps"
+			end
+			if isometric > 0 then
+				bits[#bits + 1] = isometric .. (isometric == 1 and " isometric map" or " isometric maps") .. " kept as .collection"
+			end
+			convert_note = table.concat(bits, "; ")
+		end
+	end
+
+	return true, nil, convert_note
 end
 
 -- ----------------------------------------------------------------------------
@@ -606,6 +949,7 @@ local download_options_dialog = editor.ui.component(function(props)
 	local is_file, set_is_file = editor.ui.use_state(props.folder_is_file)
 	local include_assets, set_include_assets = editor.ui.use_state(props.include_assets)
 	local overwrite, set_overwrite = editor.ui.use_state(props.overwrite)
+	local convert_tilemap, set_convert_tilemap = editor.ui.use_state(props.convert_tilemap)
 
 	local issue_msg = folder_issue_message(folder, is_file)
 	local issue
@@ -656,6 +1000,18 @@ local download_options_dialog = editor.ui.component(function(props)
 		tooltip = "When unchecked, files already in the folder are kept and "
 			.. "only new files are added.",
 	})
+	children[#children + 1] = editor.ui.check_box({
+		value = convert_tilemap,
+		on_value_changed = set_convert_tilemap,
+		text = "Convert orthogonal maps to native tile maps",
+		tooltip = "Tilemaps.com exports every project as a .collection, the format that supports "
+			.. "isometric maps and tile animation. When checked, orthogonal maps are converted to "
+			.. "Defold's native .tilemap after download for better runtime performance with large "
+			.. "maps, replacing the .collection with a lightweight .go + .tilemap pair. Native tile "
+			.. "maps don't support animated tiles, and only support orthogonal projection, so "
+			.. "isometric maps are always kept as .collection. Download again with this unchecked "
+			.. "to get the original .collection back.",
+	})
 
 	-- Existing folder => this is an update; word the title/confirm button to match the card button.
 	local action = exists and "Update" or "Download"
@@ -673,7 +1029,12 @@ local download_options_dialog = editor.ui.component(function(props)
 				text = action,
 				default = true,
 				enabled = issue_msg == nil,
-				result = { folder = folder, include_assets = include_assets, overwrite = overwrite },
+				result = {
+					folder = folder,
+					include_assets = include_assets,
+					overwrite = overwrite,
+					convert_tilemap = convert_tilemap,
+				},
 			}),
 		},
 	})
@@ -700,6 +1061,7 @@ local function download_project(project, ctx)
 		folder_is_file = initial_is_file,
 		include_assets = not slug_flag(PREF_NO_ASSETS, slug),
 		overwrite = slug_flag(PREF_OVERWRITE, slug),
+		convert_tilemap = not slug_flag(PREF_KEEP_COLLECTION, slug),
 	}))
 	if not opts then
 		ctx.set_status("Download cancelled.")
@@ -718,6 +1080,7 @@ local function download_project(project, ctx)
 	-- Remember the choices for next time (overwrite only when the folder existed and the box was shown).
 	editor.prefs.set(PREF_FOLDERS, with_key(saved_folders, slug, folder))
 	set_slug_flag(PREF_NO_ASSETS, slug, not opts.include_assets)
+	set_slug_flag(PREF_KEEP_COLLECTION, slug, not opts.convert_tilemap)
 	if folder_exists then
 		set_slug_flag(PREF_OVERWRITE, slug, opts.overwrite)
 	end
@@ -732,16 +1095,21 @@ local function download_project(project, ctx)
 
 	ctx.set_status(verb_ing .. " '" .. title .. "'…")
 	print("[Tilemaps Store] " .. verb_ing .. " '" .. title .. "' (release " .. release_id .. ")…")
-	local ok, err = download_and_extract(url, folder, {
+	local ok, err, convert_note = download_and_extract(url, folder, {
 		token = ctx.token,
 		overwrite = opts.overwrite or not folder_exists,  -- nothing to keep in a fresh folder
 		include_assets = opts.include_assets,
+		convert_tilemap = opts.convert_tilemap,
 	})
 	if ok then
 		-- Status BEFORE editor.save/prefs.set: those consume the render cycle, so a later set_status
 		-- wouldn't repaint until the next UI event (bar stuck on "Downloading…").
-		ctx.set_status(verb_done .. " '" .. title .. "' to /" .. folder)
-		print("[Tilemaps Store] " .. verb_done .. " '" .. title .. "' to /" .. folder)
+		local done_msg = verb_done .. " '" .. title .. "' to /" .. folder
+		if convert_note then
+			done_msg = done_msg .. " (" .. convert_note .. ")"
+		end
+		ctx.set_status(done_msg)
+		print("[Tilemaps Store] " .. done_msg)
 		editor.prefs.set(PREF_TITLES, with_key(editor.prefs.get(PREF_TITLES) or EMPTY_LIST, slug, title))
 		pcall(editor.save)
 	else
@@ -1402,6 +1770,10 @@ function M.get_prefs_schema()
 			scope = editor.prefs.SCOPE.PROJECT,
 		}),
 		[PREF_NO_ASSETS] = editor.prefs.schema.set({
+			item = editor.prefs.schema.string(),
+			scope = editor.prefs.SCOPE.PROJECT,
+		}),
+		[PREF_KEEP_COLLECTION] = editor.prefs.schema.set({
 			item = editor.prefs.schema.string(),
 			scope = editor.prefs.SCOPE.PROJECT,
 		}),
