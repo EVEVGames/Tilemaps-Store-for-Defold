@@ -25,7 +25,7 @@ Tilemaps Store is a Defold **editor script** and installs like any other Defold 
 2. Under the **Dependencies** section, add the URL of the latest release `.zip`:
 
    ```
-    https://github.com/EVEVGames/Tilemaps-Store-for-Defold/archive/refs/tags/1.0.zip
+    https://github.com/EVEVGames/Tilemaps-Store-for-Defold/archive/refs/tags/1.2.zip
    ```
 
 3. Select **Project → Fetch Libraries** in the Defold editor.
