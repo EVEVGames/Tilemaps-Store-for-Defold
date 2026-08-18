@@ -2,7 +2,7 @@
   <img src="https://tilemaps.com/static/img/logo-dark-theme-2x.png" alt="Tilemaps.com" height="64">
 </p>
 
-<h1 align="center"><strong>Tilemaps Store</strong> for <strong>Defold</strong></h1>
+<h1 align="center">Tilemaps Store for Defold</h1>
 
 <p align="center">
   Import <a href="https://tilemaps.com">Tilemaps.com</a> projects into <a href="https://defold.com">Defold</a>.
@@ -15,62 +15,73 @@
   <a href="https://tilemaps.com"><img src="https://img.shields.io/badge/marketplace-tilemaps.com-ff5555.svg" alt="Tilemaps.com"></a>
 </p>
 
----
-
 ## Installation
 
-Tilemaps Store is a Defold **editor script** and installs like any other Defold library dependency.
+This is a Defold editor script, so it installs like any other library dependency.
 
 1. Open your `game.project` file (in the editor, or as text).
-2. Under the **Dependencies** section, add the URL of the latest release `.zip`:
+2. Under Dependencies, add the URL of the latest release zip:
 
    ```
-    https://github.com/EVEVGames/Tilemaps-Store-for-Defold/archive/refs/tags/1.3.zip
+   https://github.com/EVEVGames/Tilemaps-Store-for-Defold/archive/refs/tags/1.3.zip
    ```
 
-3. Select **Project → Fetch Libraries** in the Defold editor.
+3. Select Project → Fetch Libraries in the Defold editor.
 
-Once the library is fetched, open the store from the editor's **Project** menu → **Tilemaps Store**.
+After the library is fetched, the store shows up in the editor's Project menu as "Tilemaps Store".
 
 ## Getting started
 
-The first time you open **Tilemaps Store**, it asks for your **Tilemaps.com API token**.
+The first time you open it, the store asks for your Tilemaps.com API token.
 
-- Click **Open account settings** in the dialog (or go to [tilemaps.com/settings/account](https://tilemaps.com/settings/account)).
-- Copy your personal API token, paste it into the field, and press **Enter**.
+Click "Open account settings" in the dialog, or head straight to
+[tilemaps.com/settings/account](https://tilemaps.com/settings/account), copy your
+personal token, paste it into the field and press Enter.
 
-Your token is stored securely in the editor's global preferences, so you only enter it once. If a saved token ever stops working, the store re-prompts you for a new one.
+The token is kept in the editor's global preferences, so you only type it once. If a
+saved token stops working, you'll be asked for a new one.
 
 ## Tabs
 
-Once connected, the store opens as a single dialog with five tabs:
+The store opens as a single dialog with five tabs:
 
-| Tab | What it shows |
-| --- | --- |
-| **Explore** | The public Tilemaps.com marketplace. Search by title and browse everything available to download or buy. |
-| **My Projects** | Projects you own, including your in-progress **dev** builds. |
-| **My Collaborations** | Projects you've been invited to work on, with your role shown on each card. |
-| **My Purchases** | Projects you've bought — ready to download into any game. |
-| **Downloaded** | A local registry of what you've already imported into *this* project. Shows which folder each one lives in and offers an **Update** button to re-download the latest version. |
+- **Explore**: the public marketplace. Search by title and browse everything you can
+  download or buy.
+- **My Projects**: projects you own, including their in-progress dev builds.
+- **My Collaborations**: projects you were invited to work on. Each card shows your role.
+- **My Purchases**: projects you've bought.
+- **Downloaded**: a local registry of what you already imported into this project. It
+  remembers the folder each one went into and has an Update button to pull the latest
+  version.
 
-Every card shows a thumbnail, a content summary (tilemaps · tilesets · assets), and a version selector. Downloading extracts the project's Defold export into a folder of your choosing, with options to **include project assets** and to **overwrite** existing files.
+Cards show a thumbnail, how much content the project has (tilemaps, tilesets, assets) and
+a version selector. Downloading extracts the project's Defold export into a folder you
+pick, and you can choose whether to include project assets and whether to overwrite
+existing files.
 
-## Development build vs. Releases
+## Development build vs. releases
 
-Each project's version selector offers up to two kinds of versions:
+The version selector offers up to two kinds of versions:
 
-- **Development build** — the project's live, work-in-progress build. It always reflects the *current* state of the project on Tilemaps.com and can change at any time. This option appears for projects **you own** (in **My Projects**) as well as projects **you collaborate on** (in **My Collaborations**), and is the default selection when available.
-- **Releases** — immutable, published snapshots (`Release #1`, `Release #2`, …). The most recent one is marked **(latest)**. Releases never change once published, so they're what you'll typically ship with.
+**Development build** is the live, work-in-progress build. It always reflects the current
+state of the project on Tilemaps.com, so it can change at any time. You'll see it for
+projects you own and for projects you collaborate on, and it's preselected when available.
+
+**Releases** are published snapshots (Release #1, Release #2, and so on), with the most
+recent marked as latest. They never change once published, which usually makes them the
+safer thing to ship with.
 
 ### Updating an imported project
 
-1. Open **Tilemaps Store** from the **Project** menu and go to the **Downloaded** tab.
-2. Find the project — it shows the folder it was imported into.
-3. Pick the version you want from the selector (a newer **Release**, or the latest **Development build** for projects you own or collaborate on).
-4. Press **Update**. The store re-downloads that version into the same folder it remembered.
+1. Open Tilemaps Store from the Project menu and go to the Downloaded tab.
+2. Find the project. The card shows the folder it was imported into.
+3. Pick the version you want: a newer release, or the latest development build if the
+   project is yours or you collaborate on it.
+4. Press Update. The files are re-downloaded into the same folder as before.
 
-> Keep **Overwrite** enabled when updating so the new files replace the old ones. If you've made local edits inside the imported folder, back them up first — overwriting replaces matching files.
+Leave Overwrite enabled when updating, otherwise the old files stay. If you edited
+anything inside the imported folder, back it up first, since matching files are replaced.
 
 ## License
 
-Released under the [MIT License](LICENSE). © 2026 Tilemaps.com
+MIT, see [LICENSE](LICENSE). © 2026 Tilemaps.com
