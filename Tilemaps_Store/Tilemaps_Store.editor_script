@@ -1,6 +1,6 @@
 -- ============================================================================
--- Tilemaps Store — Defold editor script.
--- (c) 2026 Tilemaps.com — All rights reserved.
+-- Tilemaps Store: Defold editor script.
+-- (c) 2026 Tilemaps.com. All rights reserved.
 -- ============================================================================
 
 local M = {}
@@ -12,13 +12,14 @@ local BASE_URL     = "https://tilemaps.com"
 local API_URL      = BASE_URL .. "/api/v1/"
 local DOWNLOAD_FMT = "defold"
 local PER_PAGE     = 12
+local SLUG_FILTER_MAX_CHARS = 500
+local SLUG_FILTER_MAX_ITEMS = 50
 local LOGO_URL     = BASE_URL .. "/static/img/logo-dark-theme-2x.png"
-local TMP_ZIP_NAME = "tilemaps_store_download.zip"   -- written under /.internal
+local TMP_ZIP_NAME = "tilemaps_store_download.zip"
 
 local PATH_SEP   = package.config:sub(1, 1)
 local IS_WINDOWS = PATH_SEP ~= "/"
 
--- Files we never rewrite/scan as text during path adaptation.
 local BINARY_EXT = {
 	png = true, jpg = true, jpeg = true, gif = true, bmp = true, tga = true,
 	psd = true, wav = true, ogg = true, opus = true, mp3 = true, ttf = true,
@@ -26,11 +27,11 @@ local BINARY_EXT = {
 }
 
 local PREF_TOKEN           = "tilemaps_store.api_token"
-local PREF_OVERWRITE       = "tilemaps_store.overwrite_slugs"        -- slugs with "Overwrite" checked
-local PREF_NO_ASSETS       = "tilemaps_store.exclude_assets_slugs"   -- slugs with "Include assets" unchecked
-local PREF_KEEP_COLLECTION = "tilemaps_store.keep_collection_slugs"  -- slugs with "Convert to tile map" unchecked
-local PREF_FOLDERS         = "tilemaps_store.folders"                -- slug -> chosen destination folder
-local PREF_TITLES          = "tilemaps_store.downloaded_titles"      -- slug -> title (for the Downloaded tab)
+local PREF_OVERWRITE       = "tilemaps_store.overwrite_slugs"
+local PREF_NO_ASSETS       = "tilemaps_store.exclude_assets_slugs"
+local PREF_KEEP_COLLECTION = "tilemaps_store.keep_collection_slugs"
+local PREF_FOLDERS         = "tilemaps_store.folders"
+local PREF_TITLES          = "tilemaps_store.downloaded_titles"
 
 local EMPTY_LIST = {}
 local NOT_LOADED = {}
@@ -44,9 +45,7 @@ local function new_map() return {} end
 ---@param str any
 ---@return string
 local function url_encode(str)
-	return (tostring(str):gsub("[^%w%-_%.~]", function(c)
-		return string.format("%%%02X", string.byte(c))
-	end))
+	return (tostring(str):gsub("[^%w%-_%.~]", function(c) return string.format("%%%02X", string.byte(c)) end))
 end
 
 ---Build a query string from a table, skipping nil/empty values.
@@ -124,11 +123,11 @@ end
 ---@param status integer
 ---@return string
 local function download_status_message(status)
-	if status == 0 then return "network error — no response from server" end
-	if status == 401 then return "unauthorized — check your API token" end
-	if status == 402 then return "payment required — this is a paid project you don't own" end
-	if status == 403 then return "forbidden — no access to this project or build" end
-	if status == 404 then return "not found — no Defold export for this release" end
+	if status == 0 then return "network error (no response from server)" end
+	if status == 401 then return "unauthorized (check your API token)" end
+	if status == 402 then return "payment required (this is a paid project you don't own)" end
+	if status == 403 then return "forbidden (no access to this project or build)" end
+	if status == 404 then return "not found (no Defold export for this release)" end
 	return "HTTP " .. tostring(status)
 end
 
@@ -166,23 +165,15 @@ end
 -- ----------------------------------------------------------------------------
 -- Resource path adaptation
 -- ----------------------------------------------------------------------------
--- Exports use root-absolute resource paths; under /<folder>/ they break, so we rewrite quoted refs
--- that match an extracted file to their new path. Unmatched refs (/builtins, URLs) and game.project.sample are left as-is.
 
 ---Normalize OS path separators to "/".
-local function to_slash(s)
-	return (s:gsub(PATH_SEP, "/"))
-end
+local function to_slash(s) return (s:gsub(PATH_SEP, "/")) end
 
 ---basename (segment after the last separator).
-local function basename(p)
-	return to_slash(p):match("[^/]+$")
-end
+local function basename(p) return to_slash(p):match("[^/]+$") end
 
 ---lowercase file extension without the dot.
-local function file_ext(name)
-	return (name:match("%.([%w]+)$") or ""):lower()
-end
+local function file_ext(name) return (name:match("%.([%w]+)$") or ""):lower() end
 
 ---Resource path of `abs` relative to a base of normalized length `base_len`.
 local function res_path(abs, base_len)
@@ -217,12 +208,11 @@ local function adapt_resource_paths(extract_dir, user_root)
 	local files = list_files_recursive(extract_dir)
 	if #files == 0 then return end
 
-	-- The export's root is the dir holding game.project(.sample); resource paths are absolute from there.
 	local proj_root = extract_dir
 	for _, f in ipairs(files) do
 		local name = basename(f)
 		if name == "game.project.sample" or name == "game.project" then
-			proj_root = f:sub(1, #f - #name - 1)  -- strip separator + name
+			proj_root = f:sub(1, #f - #name - 1)
 			break
 		end
 	end
@@ -231,7 +221,6 @@ local function adapt_resource_paths(extract_dir, user_root)
 	local proj_norm = to_slash(proj_root)
 	local proj_len = #proj_norm
 
-	-- old (export-root-relative) path -> new (project-root-relative) path.
 	local map = {}
 	for _, f in ipairs(files) do
 		if to_slash(f):sub(1, proj_len) == proj_norm then
@@ -255,7 +244,7 @@ local function adapt_resource_paths(extract_dir, user_root)
 				if fh then
 					local content = fh:read("*a") or ""
 					fh:close()
-					if not content:find("\0", 1, true) then  -- skip binaries missed by the extension check
+					if not content:find("\0", 1, true) then
 						local new_content = rewrite(content)
 						if new_content ~= content then
 							local w = io.open(f, "wb")
@@ -272,7 +261,7 @@ local function adapt_resource_paths(extract_dir, user_root)
 end
 
 ---Download a project ZIP and extract its whole contents into /<folder>/ (created if missing), then adapt paths.
----What the archive holds — assets or not, native .tilemap or .collection — is decided by Tilemaps.com from
+---What the archive holds (assets or not, native .tilemap or .collection) is decided by Tilemaps.com from
 ---the query flags in `url`, so there is nothing to convert or strip once it lands.
 ---@param url string
 ---@param folder string destination folder name (project.folder)
@@ -280,7 +269,6 @@ end
 ---@return boolean success
 ---@return string|nil err
 local function download_and_extract(url, folder, opts)
-	-- Resolve absolute paths via the editor (subprocess CWD is not the project root).
 	local internal = editor.external_file_attributes(".internal")
 	local root = editor.external_file_attributes(".")
 	if not (internal and internal.path and root and root.path) then
@@ -298,7 +286,6 @@ local function download_and_extract(url, folder, opts)
 		return false, download_error_message(url, { Authorization = "Bearer " .. opts.token }, status)
 	end
 
-	-- zip.unpack creates the target dir; OVERWRITE replaces conflicts, SKIP keeps existing files.
 	local unpack_ok, result, unpack_err = pcall(zip.unpack, tmp, target, {
 		on_conflict = opts.overwrite and zip.ON_CONFLICT.OVERWRITE or zip.ON_CONFLICT.SKIP,
 	})
@@ -319,10 +306,10 @@ end
 -- Release / version helpers
 -- ----------------------------------------------------------------------------
 
----Newest published release id (last non-"dev" entry, oldest→newest ordering).
----@param releases table
+---Newest published release version (last non-"dev" entry, oldest-to-newest ordering).
+---@param releases table release versions, as published by the project owner
 ---@return string|nil
-local function newest_release_id(releases)
+local function newest_release_version(releases)
 	for i = #releases, 1, -1 do
 		if releases[i] ~= "dev" then
 			return releases[i]
@@ -331,32 +318,49 @@ local function newest_release_id(releases)
 	return nil
 end
 
----Default release id for a card: the live "dev" build when offered, else the newest published, else "latest".
+---Default release version for a card: the live "dev" build when offered, else the newest published, else "latest".
 ---@param project table
 ---@return string
 local function default_release(project)
 	local releases = project.releases_id or EMPTY_LIST
-	for _, id in ipairs(releases) do
-		if id == "dev" then
+	for _, version in ipairs(releases) do
+		if version == "dev" then
 			return "dev"
 		end
 	end
-	return newest_release_id(releases) or "latest"
+	return newest_release_version(releases) or "latest"
 end
 
----Human-friendly label for a release id in the version dropdown.
----@param id string
----@param newest string|nil newest published id (gets a "(latest)" marker)
+---Human-friendly label for a release version in the version dropdown.
+---The API lists the version names the project owner published ("v1.0.0"), so show them as-is.
+---@param version string
+---@param newest string|nil newest published version (gets a "(latest)" marker)
 ---@return string
-local function release_label(id, newest)
-	if id == "dev" then
+local function release_label(version, newest)
+	if version == "dev" then
 		return "Development build"
-	elseif id == "latest" then
+	elseif version == "latest" then
 		return "Latest release"
-	elseif newest and id == newest then
-		return "Release #" .. id .. " (latest)"
+	elseif newest and version == newest then
+		return version .. " (latest)"
 	end
-	return "Release #" .. id
+	return version
+end
+
+---Version-dropdown options for a card, newest first: the order the website's download page uses.
+---The API hands the list back oldest-to-newest with "dev" appended, so reversing it puts the live
+---build on top, followed by the newest release. A project with no releases yet offers "latest".
+---@param releases table release versions from the API
+---@return table
+local function release_options(releases)
+	if #releases == 0 then
+		return { "latest" }
+	end
+	local options = {}
+	for i = #releases, 1, -1 do
+		options[#options + 1] = releases[i]
+	end
+	return options
 end
 
 ---Return a copy of `map` with `key` set to `value` (immutable state update).
@@ -440,7 +444,7 @@ local function set_slug_flag(pref, slug, flagged)
 	for k, v in pairs(set) do
 		copy[k] = v
 	end
-	copy[slug] = flagged or nil   -- sets store `true` values; absent means false
+	copy[slug] = flagged or nil
 	editor.prefs.set(pref, copy)
 end
 
@@ -493,12 +497,10 @@ end
 -- Token modal
 -- ----------------------------------------------------------------------------
 
--- string_field only reports on commit (Enter / focus loss), not per keystroke; we clear the error on edit.
 local token_dialog = editor.ui.component(function(props)
 	local token, set_token = editor.ui.use_state(props.prefill or "")
 	local error_msg, set_error = editor.ui.use_state(props.message)
 
-	-- Surface a bad token through the field's `issue` (invalid = ERROR, couldn't-verify = WARNING).
 	local issue
 	if error_msg and error_msg ~= "" then
 		issue = {
@@ -522,13 +524,11 @@ local token_dialog = editor.ui.component(function(props)
 	})
 	children[#children + 1] = editor.ui.button({
 		text = "Open account settings",
-		on_pressed = function()
-			editor.browse(BASE_URL .. "/settings/account")
-		end,
+		on_pressed = function() editor.browse(BASE_URL .. "/settings/account") end,
 	})
 
 	return editor.ui.dialog({
-		title = "Tilemaps.com — API Token",
+		title = "Tilemaps.com API Token",
 		header = editor.ui.horizontal({
 			spacing = editor.ui.SPACING.MEDIUM,
 			alignment = editor.ui.ALIGNMENT.CENTER,
@@ -595,10 +595,6 @@ end
 -- ----------------------------------------------------------------------------
 -- Download options modal
 -- ----------------------------------------------------------------------------
--- Editable destination folder (resource_field, validated via `issue`) + include-assets / native-tilemap /
--- overwrite choices, all remembered per slug. Assets and tile map shape are query flags on the download
--- route, so Tilemaps.com builds exactly the archive we asked for and the editor just extracts it. The typed
--- path only commits on Enter/blur, so existence checks run in on_value_changed.
 
 local download_options_dialog = editor.ui.component(function(props)
 	local folder, set_folder = editor.ui.use_state(props.folder)
@@ -626,7 +622,6 @@ local download_options_dialog = editor.ui.component(function(props)
 			on_value_changed = function(value)
 				local path = (value or ""):gsub("^/+", "")
 				local now_exists, now_is_file = folder_state(path)
-				-- The selector only lists files; picking one means "use its containing folder".
 				if now_is_file then
 					local parent = path:match("^(.*)/[^/]+$")
 					if parent and parent ~= "" then
@@ -639,7 +634,6 @@ local download_options_dialog = editor.ui.component(function(props)
 				set_is_file(now_is_file)
 			end,
 		}),
-		-- Static label: check_box text is single-line, so a folder path here would stretch the dialog.
 		editor.ui.check_box({
 			value = include_assets,
 			on_value_changed = set_include_assets,
@@ -648,7 +642,6 @@ local download_options_dialog = editor.ui.component(function(props)
 				.. "the archive, so it is never downloaded. Maps, tilesets and docs are unaffected.",
 		}),
 	}
-	-- Always shown; only usable once the chosen folder exists (a first download has nothing to overwrite).
 	children[#children + 1] = editor.ui.check_box({
 		value = overwrite,
 		on_value_changed = set_overwrite,
@@ -661,15 +654,10 @@ local download_options_dialog = editor.ui.component(function(props)
 		value = native_tilemap,
 		on_value_changed = set_native_tilemap,
 		text = "Convert orthogonal maps to native tile maps",
-		tooltip = "By default Tilemaps.com exports every map as a .collection — one sprite per tile — the "
-			.. "format that covers isometric projection and tile animation. When checked, the server "
-			.. "exports each map it can as a single native .tilemap instead, which is far cheaper at "
-			.. "runtime for large maps. Isometric maps, and maps whose tiles are larger than the grid, "
-			.. "are exported as a .collection anyway; the export's README.txt names each one and why. "
-			.. "Download again with this unchecked to get every map back as a .collection.",
+		tooltip = "Exports each map the server can as a single native .tilemap, far cheaper at runtime than "
+			.. "the default .collection (one sprite per tile). Maps it cannot convert stay .collection; see README.txt.",
 	})
 
-	-- Existing folder => this is an update; word the title/confirm button to match the card button.
 	local action = exists and "Update" or "Download"
 
 	return editor.ui.dialog({
@@ -704,10 +692,9 @@ end)
 ---@param ctx table { token, selection, set_status }
 local function download_project(project, ctx)
 	local slug = project.slug
-	local release_id = ctx.selection[slug] or default_release(project)
+	local release_version = ctx.selection[slug] or default_release(project)
 	local title = project.title or project.name or slug
 
-	-- Options gate, prefilled from the remembered per-slug choices (folder falls back to the project default).
 	local saved_folders = editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST
 	local initial_folder = saved_folders[slug] or project.folder or slug
 	local initial_exists, initial_is_file = folder_state(initial_folder)
@@ -724,7 +711,6 @@ local function download_project(project, ctx)
 		return
 	end
 
-	-- Re-validate the chosen folder outside the dialog (belt and braces).
 	local folder = opts.folder
 	local folder_exists, folder_is_file = folder_state(folder)
 	local bad = folder_issue_message(folder, folder_is_file)
@@ -733,7 +719,6 @@ local function download_project(project, ctx)
 		return
 	end
 
-	-- Remember the choices for next time (overwrite only when the folder existed and the box was shown).
 	editor.prefs.set(PREF_FOLDERS, with_key(saved_folders, slug, folder))
 	set_slug_flag(PREF_NO_ASSETS, slug, not opts.include_assets)
 	set_slug_flag(PREF_KEEP_COLLECTION, slug, not opts.native_tilemap)
@@ -741,35 +726,29 @@ local function download_project(project, ctx)
 		set_slug_flag(PREF_OVERWRITE, slug, opts.overwrite)
 	end
 
-	-- Both shape flags default to off server-side, so they only go on the wire when asked for.
 	local url = BASE_URL .. "/project/" .. url_encode(slug) .. "/download/" .. DOWNLOAD_FMT
 		.. "?" .. build_query({
-			release_id = release_id,
+			release_id = release_version,
 			no_assets = (not opts.include_assets) and "1" or nil,
 			native_tilemap = opts.native_tilemap and "1" or nil,
 		})
 
-	-- Existing folder => "update"; fresh folder => "download". Match the card button wording.
 	local verb_ing = folder_exists and "Updating" or "Downloading"
 	local verb_done = folder_exists and "Updated" or "Downloaded"
 	local verb_fail = folder_exists and "Update" or "Download"
 
 	ctx.set_status(verb_ing .. " '" .. title .. "'…")
-	print("[Tilemaps Store] " .. verb_ing .. " '" .. title .. "' (release " .. release_id .. ")…")
+	print("[Tilemaps Store] " .. verb_ing .. " '" .. title .. "' (version " .. release_version .. ")…")
 	local ok, err = download_and_extract(url, folder, {
 		token = ctx.token,
-		overwrite = opts.overwrite or not folder_exists,  -- nothing to keep in a fresh folder
+		overwrite = opts.overwrite or not folder_exists,
 	})
 	if ok then
-		-- Status BEFORE editor.save/prefs.set: those consume the render cycle, so a later set_status
-		-- wouldn't repaint until the next UI event (bar stuck on "Downloading…").
 		local done_msg = verb_done .. " '" .. title .. "' to /" .. folder
 		ctx.set_status(done_msg)
 		print("[Tilemaps Store] " .. done_msg)
 		if opts.native_tilemap then
-			-- The server decides per map whether a native .tilemap is possible; its README lists the
-			-- ones it had to export as a .collection instead, so point there rather than guess here.
-			print("[Tilemaps Store] Native tile maps requested — see /" .. folder
+			print("[Tilemaps Store] Native tile maps requested. See /" .. folder
 				.. "/README.txt for any map exported as a .collection instead.")
 		end
 		editor.prefs.set(PREF_TITLES, with_key(editor.prefs.get(PREF_TITLES) or EMPTY_LIST, slug, title))
@@ -781,7 +760,7 @@ local function download_project(project, ctx)
 end
 
 -- ----------------------------------------------------------------------------
--- Card (plain builder — no hooks, so a function is enough)
+-- Card (plain builder; no hooks, so a function is enough)
 -- ----------------------------------------------------------------------------
 
 ---Pluralized tally fragment; nil when the count is unknown, or 0 with hide_zero (used for assets).
@@ -814,7 +793,7 @@ local function rating_stars(avg, count)
 	return string.rep("★", filled) .. string.rep("☆", 5 - filled)
 end
 
----Project page URL — the API's `url` when present, else built from the slug.
+---Project page URL: the API's `url` when present, else built from the slug.
 local function project_page_url(project)
 	if project.url and project.url ~= "" then
 		return project.url
@@ -829,11 +808,10 @@ local function build_card(project, ctx)
 	local slug = project.slug
 	local title = project.title or project.name or slug
 	local releases = project.releases_id or EMPTY_LIST
-	local newest = newest_release_id(releases)
-	local options = (#releases > 0) and releases or { "latest" }
+	local newest = newest_release_version(releases)
+	local options = release_options(releases)
 	local selected = ctx.selection[slug] or default_release(project)
 
-	-- Button verb (Update vs Download) from whether the folder the modal would prefill already exists.
 	local dest_folder = (ctx.saved_folders or EMPTY_LIST)[slug] or project.folder or slug
 	local already_here = folder_state(dest_folder)
 
@@ -889,7 +867,6 @@ local function build_card(project, ctx)
 			color = editor.ui.COLOR.TEXT,
 		})
 	end
-	-- Content tallies (nil ones skipped). Assets hide a 0; tilemaps/tilesets keep it (meaningful when a project is one-or-the-other).
 	local meta = {}
 	meta[#meta + 1] = tally_label(project.tilemap_count, project.tilemaps, "tilemap")
 	meta[#meta + 1] = tally_label(project.tileset_count, project.tilesets, "tileset")
@@ -901,15 +878,10 @@ local function build_card(project, ctx)
 		})
 	end
 
-	-- downloadable=false (paid & not owned) => send to the project page instead of offering a download.
 	if project.downloadable == false then
 		info[#info + 1] = editor.ui.button({
 			text = "Get this project",
-			on_pressed = function()
-				if project.url and project.url ~= "" then
-					editor.browse(project.url)
-				end
-			end,
+			on_pressed = function() if project.url and project.url ~= "" then editor.browse(project.url) end end,
 		})
 	else
 		info[#info + 1] = editor.ui.horizontal({
@@ -918,10 +890,8 @@ local function build_card(project, ctx)
 				editor.ui.select_box({
 					value = selected,
 					options = options,
-					to_string = function(id) return release_label(id, newest) end,
-					on_value_changed = function(id)
-						ctx.set_selection(with_key(ctx.selection, slug, id))
-					end,
+					to_string = function(version) return release_label(version, newest) end,
+					on_value_changed = function(version) ctx.set_selection(with_key(ctx.selection, slug, version)) end,
 					grow = true,
 				}),
 				editor.ui.button({
@@ -985,22 +955,44 @@ local function resolve_from_list(by_slug, remaining, list)
 	end
 end
 
+---Split slugs into CSV batches the get_public_projects `slug` filter accepts.
+---The filter is capped at 500 characters server-side and a page returns at most
+---50 rows, so one CSV of every downloaded slug comes back as a 400 and the
+---Update controls silently disappear from the Downloaded tab.
+---@param slugs table array of slugs
+---@return table array of slug arrays
+local function slug_batches(slugs)
+	local batches, current, length = {}, {}, 0
+	for _, slug in ipairs(slugs) do
+		local added = #slug + ((#current > 0) and 1 or 0)
+		if #current > 0 and (#current >= SLUG_FILTER_MAX_ITEMS
+			or length + added > SLUG_FILTER_MAX_CHARS) then
+			batches[#batches + 1] = current
+			current, length = {}, 0
+			added = #slug
+		end
+		current[#current + 1] = slug
+		length = length + added
+	end
+	if #current > 0 then
+		batches[#batches + 1] = current
+	end
+	return batches
+end
+
 ---Attach each downloaded record's full API record (record.project) for update controls.
----Order stops when all resolve: my_projects → collaborations → public(slug=csv) → purchases.
+---Order stops when all resolve: my_projects, collaborations, public(slug=csv), purchases.
 ---Owner/collaborator endpoints go first so an owned public project keeps its "dev" build (public strips it).
 ---@param records table array of { slug, title, folder }
 ---@param token string
 local function enrich_downloaded(records, token)
 	if #records == 0 then return end
 
-	local remaining, slugs = {}, {}
+	local remaining = {}
 	for _, r in ipairs(records) do
 		remaining[r.slug] = true
-		slugs[#slugs + 1] = r.slug
 	end
-	local function any_remaining()
-		return next(remaining) ~= nil
-	end
+	local function any_remaining() return next(remaining) ~= nil end
 
 	local by_slug = {}
 	local b = api_get("get_my_projects", token)
@@ -1012,12 +1004,23 @@ local function enrich_downloaded(records, token)
 	end
 
 	if any_remaining() then
-		b = api_get("get_public_projects", token, {
-			slug = table.concat(slugs, ","),
-			per_page = 50,
-			page = 1,
-		})
-		resolve_from_list(by_slug, remaining, b and b.projects)
+		local pending = {}
+		for _, r in ipairs(records) do
+			if remaining[r.slug] then
+				pending[#pending + 1] = r.slug
+			end
+		end
+		for _, batch in ipairs(slug_batches(pending)) do
+			b = api_get("get_public_projects", token, {
+				slug = table.concat(batch, ","),
+				per_page = SLUG_FILTER_MAX_ITEMS,
+				page = 1,
+			})
+			resolve_from_list(by_slug, remaining, b and b.projects)
+			if not any_remaining() then
+				break
+			end
+		end
 	end
 
 	if any_remaining() then
@@ -1030,7 +1033,6 @@ local function enrich_downloaded(records, token)
 	end
 end
 
--- Delete confirmation; "Delete" is NOT the default button, so Enter can't trigger it by accident.
 local delete_dialog = editor.ui.component(function(props)
 	return editor.ui.dialog({
 		title = "Delete project",
@@ -1081,11 +1083,10 @@ local function build_downloaded_card(record, ctx)
 		editor.ui.label({ text = "Downloaded to /" .. record.folder, color = editor.ui.COLOR.HINT }),
 	}
 
-	-- Update control only when the project resolved from the API and is downloadable; re-downloads in place.
 	if project and project.downloadable ~= false then
 		local releases = project.releases_id or EMPTY_LIST
-		local newest = newest_release_id(releases)
-		local options = (#releases > 0) and releases or { "latest" }
+		local newest = newest_release_version(releases)
+		local options = release_options(releases)
 		local selected = ctx.selection[record.slug] or default_release(project)
 		info[#info + 1] = editor.ui.horizontal({
 			spacing = editor.ui.SPACING.SMALL,
@@ -1093,10 +1094,8 @@ local function build_downloaded_card(record, ctx)
 				editor.ui.select_box({
 					value = selected,
 					options = options,
-					to_string = function(id) return release_label(id, newest) end,
-					on_value_changed = function(id)
-						ctx.set_selection(with_key(ctx.selection, record.slug, id))
-					end,
+					to_string = function(version) return release_label(version, newest) end,
+					on_value_changed = function(version) ctx.set_selection(with_key(ctx.selection, record.slug, version)) end,
 					grow = true,
 				}),
 				editor.ui.button({
@@ -1118,8 +1117,6 @@ local function build_downloaded_card(record, ctx)
 				return
 			end
 			local slug, folder, ttl = record.slug, record.folder, record.title
-			-- Update the UI BEFORE the delete: editor.delete_directory consumes the render cycle, so a
-			-- set_status / list update after it wouldn't repaint until the next event. Delete + prefs run last.
 			ctx.remove_downloaded(slug)
 			ctx.set_status("Deleted '" .. ttl .. "' (/" .. folder .. ").")
 			local ok, err = pcall(editor.delete_directory, "/" .. folder)
@@ -1128,8 +1125,6 @@ local function build_downloaded_card(record, ctx)
 				editor.prefs.set(PREF_TITLES, without_key(editor.prefs.get(PREF_TITLES) or EMPTY_LIST, slug))
 				print("[Tilemaps Store] Deleted '" .. ttl .. "' (/" .. folder .. ")")
 			else
-				-- Rare (e.g. a locked file): optimistic UI is ahead of disk, but prefs/folder are intact,
-				-- so the entry reappears on the next reload. Log it since the bar can't repaint a correction.
 				print("[Tilemaps Store] Delete failed for /" .. folder .. ": " .. tostring(err))
 			end
 		end,
@@ -1163,10 +1158,10 @@ local store_dialog = editor.ui.component(function(props)
 	local tab, set_tab = editor.ui.use_state("marketplace")
 	local query, set_query = editor.ui.use_state("")
 	local marketplace, set_marketplace = editor.ui.use_state(props.initial_marketplace)
-	local my, set_my = editor.ui.use_state(NOT_LOADED)                     -- lazy
+	local my, set_my = editor.ui.use_state(NOT_LOADED)
 	local collaborations, set_collaborations = editor.ui.use_state(NOT_LOADED)
 	local purchases, set_purchases = editor.ui.use_state(NOT_LOADED)
-	local downloaded, set_downloaded = editor.ui.use_state(NOT_LOADED)       -- local registry
+	local downloaded, set_downloaded = editor.ui.use_state(NOT_LOADED)
 	local selection, set_selection = editor.ui.use_state(new_map)
 	local status, set_status = editor.ui.use_state(props.initial_status or "")
 
@@ -1181,7 +1176,6 @@ local store_dialog = editor.ui.component(function(props)
 	local source_list = (source == NOT_LOADED) and EMPTY_LIST or source
 	local filtered = editor.ui.use_memo(filter_by_title, source_list, query)
 
-	-- Loaders — only ever called from callbacks, never in render.
 	local function reload_marketplace(page, search)
 		local body, err = api_get("get_public_projects", token, {
 			page = page,
@@ -1206,14 +1200,12 @@ local store_dialog = editor.ui.component(function(props)
 		set_status("")
 	end
 
-	-- Downloaded: read prefs + re-check folders, then enrich via the API. Reloads on every activation.
 	local function reload_downloaded()
 		local records = load_downloaded_records()
 		enrich_downloaded(records, token)
 		set_downloaded(records)
 	end
 
-	-- Drop one entry locally (no API); delete uses this before editor.delete_directory so the UI repaints.
 	local function remove_downloaded(slug)
 		if downloaded == NOT_LOADED then
 			return
@@ -1229,7 +1221,6 @@ local store_dialog = editor.ui.component(function(props)
 
 	local list = (tab == "marketplace") and marketplace.items or filtered
 
-	-- Read once so build_card can label its button Update vs Download.
 	local saved_folders = editor.prefs.get(PREF_FOLDERS) or EMPTY_LIST
 
 	local cards = {}
@@ -1268,7 +1259,6 @@ local store_dialog = editor.ui.component(function(props)
 		cards[1] = editor.ui.label({ text = empty_text, color = editor.ui.COLOR.HINT })
 	end
 
-	-- One tab button; loads its data lazily on first activation.
 	local function tab_button(label, id)
 		return editor.ui.button({
 			text = label,
@@ -1367,11 +1357,7 @@ local store_dialog = editor.ui.component(function(props)
 				editor.ui.button({
 					text = "Profile",
 					enabled = props.username ~= nil,
-					on_pressed = function()
-						if props.username then
-							editor.browse(BASE_URL .. "/user/" .. props.username)
-						end
-					end,
+					on_pressed = function() if props.username then editor.browse(BASE_URL .. "/user/" .. props.username) end end,
 				}),
 			},
 		}),
@@ -1393,7 +1379,6 @@ end)
 local function open_store()
 	local token = editor.prefs.get(PREF_TOKEN) or ""
 
-	-- Validate the saved token by fetching the first marketplace page; prompt when missing or rejected.
 	local body, err
 	if token ~= "" then
 		body, err = api_get("get_public_projects", token, { page = 1, per_page = PER_PAGE })
