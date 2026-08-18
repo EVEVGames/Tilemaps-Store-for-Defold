@@ -35,7 +35,6 @@ local PREF_TITLES          = "tilemaps_store.downloaded_titles"
 
 local EMPTY_LIST = {}
 local NOT_LOADED = {}
-local function new_map() return {} end
 
 -- ----------------------------------------------------------------------------
 -- Small helpers
@@ -166,18 +165,9 @@ end
 -- Resource path adaptation
 -- ----------------------------------------------------------------------------
 
----Normalize OS path separators to "/".
-local function to_slash(s) return (s:gsub(PATH_SEP, "/")) end
-
----basename (segment after the last separator).
-local function basename(p) return to_slash(p):match("[^/]+$") end
-
----lowercase file extension without the dot.
-local function file_ext(name) return (name:match("%.([%w]+)$") or ""):lower() end
-
 ---Resource path of `abs` relative to a base of normalized length `base_len`.
 local function res_path(abs, base_len)
-	local rel = to_slash(abs):sub(base_len + 1)
+	local rel = (abs:gsub(PATH_SEP, "/")):sub(base_len + 1)
 	if rel:sub(1, 1) ~= "/" then rel = "/" .. rel end
 	return rel
 end
@@ -210,42 +200,38 @@ local function adapt_resource_paths(extract_dir, user_root)
 
 	local proj_root = extract_dir
 	for _, f in ipairs(files) do
-		local name = basename(f)
+		local name = (f:gsub(PATH_SEP, "/")):match("[^/]+$")
 		if name == "game.project.sample" or name == "game.project" then
 			proj_root = f:sub(1, #f - #name - 1)
 			break
 		end
 	end
 
-	local user_len = #to_slash(user_root)
-	local proj_norm = to_slash(proj_root)
+	local user_len = #(user_root:gsub(PATH_SEP, "/"))
+	local proj_norm = (proj_root:gsub(PATH_SEP, "/"))
 	local proj_len = #proj_norm
 
 	local map = {}
 	for _, f in ipairs(files) do
-		if to_slash(f):sub(1, proj_len) == proj_norm then
+		if (f:gsub(PATH_SEP, "/")):sub(1, proj_len) == proj_norm then
 			map[res_path(f, proj_len)] = res_path(f, user_len)
 		end
 	end
 
-	local function rewrite(content)
-		return (content:gsub("([\"'])(/[^\"'%c]*)([\"'])", function(q1, p, q2)
-			local mapped = map[p]
-			if mapped then return q1 .. mapped .. q2 end
-			return q1 .. p .. q2
-		end))
-	end
-
 	for _, f in ipairs(files) do
-		if to_slash(f):sub(1, proj_len) == proj_norm then
-			local name = basename(f)
-			if name ~= "game.project.sample" and not BINARY_EXT[file_ext(name)] then
+		if (f:gsub(PATH_SEP, "/")):sub(1, proj_len) == proj_norm then
+			local name = (f:gsub(PATH_SEP, "/")):match("[^/]+$")
+			if name ~= "game.project.sample" and not BINARY_EXT[(name:match("%.([%w]+)$") or ""):lower()] then
 				local fh = io.open(f, "rb")
 				if fh then
 					local content = fh:read("*a") or ""
 					fh:close()
 					if not content:find("\0", 1, true) then
-						local new_content = rewrite(content)
+						local new_content = (content:gsub("([\"'])(/[^\"'%c]*)([\"'])", function(q1, p, q2)
+							local mapped = map[p]
+							if mapped then return q1 .. mapped .. q2 end
+							return q1 .. p .. q2
+						end))
 						if new_content ~= content then
 							local w = io.open(f, "wb")
 							if w then
@@ -992,18 +978,17 @@ local function enrich_downloaded(records, token)
 	for _, r in ipairs(records) do
 		remaining[r.slug] = true
 	end
-	local function any_remaining() return next(remaining) ~= nil end
 
 	local by_slug = {}
 	local b = api_get("get_my_projects", token)
 	resolve_from_list(by_slug, remaining, b and b.projects)
 
-	if any_remaining() then
+	if next(remaining) ~= nil then
 		b = api_get("get_collaborations", token)
 		resolve_from_list(by_slug, remaining, b and b.collaborations)
 	end
 
-	if any_remaining() then
+	if next(remaining) ~= nil then
 		local pending = {}
 		for _, r in ipairs(records) do
 			if remaining[r.slug] then
@@ -1017,13 +1002,13 @@ local function enrich_downloaded(records, token)
 				page = 1,
 			})
 			resolve_from_list(by_slug, remaining, b and b.projects)
-			if not any_remaining() then
+			if next(remaining) == nil then
 				break
 			end
 		end
 	end
 
-	if any_remaining() then
+	if next(remaining) ~= nil then
 		b = api_get("get_purchases", token)
 		resolve_from_list(by_slug, remaining, b and b.purchases)
 	end
@@ -1162,7 +1147,7 @@ local store_dialog = editor.ui.component(function(props)
 	local collaborations, set_collaborations = editor.ui.use_state(NOT_LOADED)
 	local purchases, set_purchases = editor.ui.use_state(NOT_LOADED)
 	local downloaded, set_downloaded = editor.ui.use_state(NOT_LOADED)
-	local selection, set_selection = editor.ui.use_state(new_map)
+	local selection, set_selection = editor.ui.use_state(function() return {} end)
 	local status, set_status = editor.ui.use_state(props.initial_status or "")
 
 	local source = my
