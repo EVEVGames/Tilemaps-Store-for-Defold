@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="https://tilemaps.com/static/img/logo-dark-theme-2x.png" alt="Tilemaps.com" height="64">
+  <img src="https://cdn.tilemaps.com/media_files/1/0f586173-c7c1-4045-b12f-49eb5e029c91_Tilemaps_InEditor_Tilemap_Store_for_Defold.png" alt="Tilemaps.com">
 </p>
-
-<h1 align="center">Tilemaps Store for Defold</h1>
 
 <p align="center">
   Import <a href="https://tilemaps.com">Tilemaps.com</a> projects into <a href="https://defold.com">Defold</a>.
